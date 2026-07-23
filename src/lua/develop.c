@@ -54,7 +54,12 @@
 // builds a DT_MASKS_PATH form from a normalized polygon, wires it to the
 // module's blend group via dt_masks_gui_form_save_creation, and turns on the
 // drawn-mask blend mode so the module's effect is restricted to the region.
-#define DT_LUA_DEVELOP_API 5
+// API 6 (T2.4): get_viewport() now adds a ready-to-use `region` {x,y,w,h} to
+// each viewport (main, and preview2 when active) -- the visible sub-rectangle of
+// the full image in TOP-LEFT normalized 0..1 coords, CLAMPED to [0,1]. It is a
+// drop-in for get_preview()'s `region` arg; the raw center-relative zoom_x/
+// zoom_y (which can be negative) are NOT. Purely additive: all API-5 fields kept.
+#define DT_LUA_DEVELOP_API 6
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -1268,7 +1273,35 @@ static const char *_zoom_name(dt_dev_zoom_t z)
        only when port->pipe exists (it needs the processed size), else we fall
        back to the raw stored port->zoom_scale.
    Fields: {zoom=<int enum>, zoom_label, closeup, zoom_x, zoom_y, scale,
-            zoom_scale_raw}. Units documented above. Read-only. */
+            zoom_scale_raw, viewport_width, viewport_height, region}.
+
+   region (POST-FIX -- the drop-in coord) ----------------------------------
+   The raw zoom_x/zoom_y above are CENTER-relative (image center = 0) and can be
+   NEGATIVE, so they do NOT compose with get_preview()'s `region` arg, which is
+   TOP-LEFT and must be in [0,1]. `region` fixes that: it is the sub-rectangle of
+   the FULL image currently visible in this window, expressed as TOP-LEFT
+   normalized 0..1 image coords {x,y,w,h}, CLAMPED to [0,1]. It is therefore
+   directly valid as get_preview()'s `region` with no caller math.
+
+   Derivation (mirrors the GUI's own visible-rect math, verified against source):
+     * Visible extent as a fraction of the full image, per axis, is exactly the
+       "box" that dt_dev_get_zoom_bounds (develop.c:2823) computes:
+           w = port->width  / (procw * scale)
+           h = port->height / (proch * scale)
+       where procw/proch = processed image size (dt_dev_get_processed_size) and
+       `scale` is the device-px-per-processed-px zoom scale (closeup's extra 2x
+       is already folded into `scale` via the 1<<closeup factor for DT_ZOOM_1).
+     * Visible CENTER in 0..1 image coords is {0.5 + zoom_x, 0.5 + zoom_y}
+       (zoom_x/zoom_y are center-relative, image center -> 0). This matches the
+       GUI expose transform (darkroom.c:1019): the drawn top-left in processed px
+       is (-0.5*width/scale + 0.5*wd + zoom_x*wd), i.e. normalized
+       x = 0.5 + zoom_x - w/2.  So top-left = center - half-extent:
+           x = 0.5 + zoom_x - w/2,  y = 0.5 + zoom_y - h/2.
+     * Clamp: at "fit" the box comes out >=1 per axis and collapses to {0,0,1,1};
+       when zoomed/panned it is a sub-rectangle clamped so x>=0, y>=0,
+       x+w<=1, y+h<=1 (never negative, never exceeding the image edge).
+   Omitted (nil) when there is no processed size to derive it from (no pipe yet).
+   Units documented above. Read-only. */
 static void _push_viewport(lua_State *L, dt_dev_viewport_t *port)
 {
   dt_dev_zoom_t zoom = DT_ZOOM_FIT;
@@ -1290,6 +1323,33 @@ static void _push_viewport(lua_State *L, dt_dev_viewport_t *port)
   lua_pushnumber(L, port->zoom_scale);        lua_setfield(L, -2, "zoom_scale_raw");
   lua_pushinteger(L, port->width);            lua_setfield(L, -2, "viewport_width");
   lua_pushinteger(L, port->height);           lua_setfield(L, -2, "viewport_height");
+
+  // region: TOP-LEFT, clamped [0,1] -- drop-in for get_preview's `region`.
+  int procw = 0, proch = 0;
+  dt_dev_get_processed_size(port, &procw, &proch);
+  if(procw > 0 && proch > 0 && scale > 0.0f)
+  {
+    // fraction of the full image visible per axis (dt_dev_get_zoom_bounds math)
+    float w = (float)port->width  / ((float)procw * scale);
+    float h = (float)port->height / ((float)proch * scale);
+    if(w > 1.0f) w = 1.0f;
+    if(h > 1.0f) h = 1.0f;
+    // top-left = visible-center (0.5 + zoom) - half-extent
+    float x = 0.5f + zx - 0.5f * w;
+    float y = 0.5f + zy - 0.5f * h;
+    // clamp so the whole rect stays inside [0,1]: x>=0, y>=0, x+w<=1, y+h<=1
+    if(x > 1.0f - w) x = 1.0f - w;
+    if(y > 1.0f - h) y = 1.0f - h;
+    if(x < 0.0f) x = 0.0f;
+    if(y < 0.0f) y = 0.0f;
+
+    lua_newtable(L);
+    lua_pushnumber(L, x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, y); lua_setfield(L, -2, "y");
+    lua_pushnumber(L, w); lua_setfield(L, -2, "w");
+    lua_pushnumber(L, h); lua_setfield(L, -2, "h");
+    lua_setfield(L, -2, "region");
+  }
 }
 
 /* darktable.develop.get_viewport()
@@ -1315,8 +1375,16 @@ static void _push_viewport(lua_State *L, dt_dev_viewport_t *port)
    Guard: not in darkroom (no dev / not gui_attached / no image) -> graceful
    {error=...}, never a crash (acceptance: error in lighttable).
 
-   Return: {main={zoom,zoom_label,closeup,zoom_x,zoom_y,scale,...},
-            preview2={active=<bool>[, ...same fields when active]}}. */
+   Return: {main={zoom,zoom_label,closeup,zoom_x,zoom_y,scale,...,region},
+            preview2={active=<bool>[, ...same fields (incl. region) when active]}}.
+
+   COMPOSING WITH get_preview: pass main.region (or preview2.region) STRAIGHT
+   INTO get_preview()'s `region` arg -- it is TOP-LEFT and clamped to [0,1], so
+   it is always valid (no >=0 / range error). Do NOT use the raw zoom_x/zoom_y
+   for that: they are center-relative and can be negative. region == "the crop
+   of the full image the user is currently looking at in this window". When a
+   viewport has no processed pipe yet (or preview2 is inactive) there is no
+   region key -- callers must treat it as full-frame / skip the crop. */
 static int get_viewport_cb(lua_State *L)
 {
   dt_develop_t *dev = darktable.develop;
