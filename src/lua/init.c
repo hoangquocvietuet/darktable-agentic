@@ -23,6 +23,7 @@
 #include "lua/call.h"
 #include "lua/configuration.h"
 #include "lua/database.h"
+#include "lua/develop.h"
 #include "lua/events.h"
 #include "lua/film.h"
 #include "lua/format.h"
@@ -135,7 +136,8 @@ static int run_early_script(lua_State* L)
 
 static lua_CFunction init_funcs[]
     = { dt_lua_init_glist,         dt_lua_init_image,       dt_lua_init_styles,   dt_lua_init_print,
-        dt_lua_init_configuration, dt_lua_init_preferences, dt_lua_init_database, dt_lua_init_gui,
+        dt_lua_init_configuration, dt_lua_init_preferences, dt_lua_init_database, dt_lua_init_develop,
+        dt_lua_init_gui,
         dt_lua_init_luastorages,   dt_lua_init_tags,        dt_lua_init_film,     dt_lua_init_call,
         dt_lua_init_view,          dt_lua_init_events,      dt_lua_init_init,     dt_lua_init_widget,
         dt_lua_init_lualib,        dt_lua_init_gettext,     dt_lua_init_guides,   dt_lua_init_cairo,
