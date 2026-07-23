@@ -38,7 +38,9 @@
 
 // API contract version of the darktable.develop bindings. Bump whenever the
 // wire shapes (see PLAN.md §3.1) change so the bridge can refuse a mismatch.
-#define DT_LUA_DEVELOP_API 1
+// API 2 (T1.7): get_params/set_params decode+encode ARRAY/STRUCT/UNION
+// composites (curves etc.); adds enable_module. API 1 was scalar/bool/enum only.
+#define DT_LUA_DEVELOP_API 2
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -161,13 +163,166 @@ static void push_int_field(lua_State *L, lua_Integer value, lua_Integer min, lua
   lua_pushinteger(L, def);   lua_setfield(L, -2, "default");
 }
 
-/* placeholder for types this task does not decode yet (array/struct/opaque):
-   {type=<t>, writable=false}. Full decode is a follow-up (PLAN.md §3.1). */
+/* placeholder for types we still cannot decode (opaque/complex/too-deep):
+   {type=<t>, writable=false}. */
 static void push_placeholder(lua_State *L, const char *type)
 {
   lua_newtable(L);
   lua_pushstring(L, type); lua_setfield(L, -2, "type");
   lua_pushboolean(L, FALSE); lua_setfield(L, -2, "writable");
+}
+
+/* Recursion depth guard shared by the composite decode (get) and encode (set)
+   walkers. darktable's deepest generated params is the tonecurve 2D
+   array-of-struct (array -> array -> struct -> float = 4 levels); 8 leaves
+   generous headroom while still bounding any pathological/cyclic descriptor. */
+#define DT_LUA_DEVELOP_MAX_DEPTH 8
+
+/* Push the scalar wire shape for a leaf introspection field read from `p`.
+   `bare` selects the CONTEXT-dependent shape (PLAN.md §3.1):
+     bare == FALSE  top-level field  -> rich object {value,min,max,default}
+                    (enum -> {value,label,options}); bool stays a bare bool.
+     bare == TRUE   element/member inside an array or struct -> just the bare
+                    number / bool / enum-integer, so an array of scalars is a
+                    JSON array of numbers and a curve node is {x=..,y=..}.
+   Pushes exactly one value. Unknown scalar types -> {type=opaque}. */
+static void decode_scalar(lua_State *L, dt_introspection_field_t *f, const void *p, gboolean bare)
+{
+  switch(f->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_FLOAT:
+      if(bare) lua_pushnumber(L, *(const float *)p);
+      else push_num_field(L, *(const float *)p, f->Float.Min, f->Float.Max, f->Float.Default);
+      break;
+    case DT_INTROSPECTION_TYPE_DOUBLE:
+      if(bare) lua_pushnumber(L, *(const double *)p);
+      else push_num_field(L, *(const double *)p, f->Double.Min, f->Double.Max, f->Double.Default);
+      break;
+    case DT_INTROSPECTION_TYPE_INT:
+      if(bare) lua_pushinteger(L, *(const int *)p);
+      else push_int_field(L, *(const int *)p, f->Int.Min, f->Int.Max, f->Int.Default);
+      break;
+    case DT_INTROSPECTION_TYPE_UINT:
+      if(bare) lua_pushinteger(L, *(const unsigned int *)p);
+      else push_int_field(L, *(const unsigned int *)p, f->UInt.Min, f->UInt.Max, f->UInt.Default);
+      break;
+    case DT_INTROSPECTION_TYPE_BOOL:
+      lua_pushboolean(L, *(const gboolean *)p);
+      break;
+    case DT_INTROSPECTION_TYPE_ENUM:
+    {
+      const int v = *(const int *)p;
+      if(bare) { lua_pushinteger(L, v); break; }
+      lua_newtable(L);
+      lua_pushinteger(L, v); lua_setfield(L, -2, "value");
+      const char *label = dt_introspection_get_enum_name(f, v);
+      lua_pushstring(L, label ? label : ""); lua_setfield(L, -2, "label");
+      lua_newtable(L);
+      int oi = 1;
+      for(dt_introspection_type_enum_tuple_t *it = f->Enum.values; it && it->name; it++)
+      {
+        lua_pushstring(L, it->name);
+        lua_rawseti(L, -2, oi++);
+      }
+      lua_setfield(L, -2, "options");
+      break;
+    }
+    default:
+      push_placeholder(L, "opaque");
+      break;
+  }
+}
+
+/* Recursively decode ANY introspection field at blob pointer `p` and push its
+   JSON-shaped value (PLAN.md §3.1). Composites recurse via the header helpers:
+     ARRAY  -> Lua array, elements at dt_introspection_access_array().
+               A CHAR array is emitted as a Lua string (C string field).
+     STRUCT/UNION -> Lua object keyed by each child's field_name, child pointer
+               computed as p + (child.offset - self.offset) -- the same
+               relative-offset math dt_introspection_get_child() uses.
+   Elements/members are decoded `bare` (numbers/objects without min/max), so a
+   scalar array is [n,n,..] and a struct/curve node is {x=..,y=..}. Depth-bounded
+   by DT_LUA_DEVELOP_MAX_DEPTH; over the limit a {type=too_deep} placeholder is
+   pushed instead of recursing. Pushes exactly one value. */
+static void decode_field(lua_State *L, dt_introspection_field_t *f, const void *p, int depth,
+                         gboolean bare)
+{
+  luaL_checkstack(L, 6, "get_params decode");
+  if(depth > DT_LUA_DEVELOP_MAX_DEPTH) { push_placeholder(L, "too_deep"); return; }
+
+  switch(f->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_ARRAY:
+    {
+      // a char[] is a C string -> emit as one Lua string, not an array of bytes
+      if(f->Array.type == DT_INTROSPECTION_TYPE_CHAR)
+      {
+        const char *s = (const char *)p;
+        lua_pushlstring(L, s, strnlen(s, f->Array.count));
+        break;
+      }
+      lua_newtable(L);
+      for(unsigned int e = 0; e < f->Array.count; e++)
+      {
+        dt_introspection_field_t *child = NULL;
+        void *ep = dt_introspection_access_array(f, (void *)p, e, &child);
+        if(!ep || !child) lua_pushnil(L);
+        else decode_field(L, child, ep, depth + 1, TRUE);
+        lua_rawseti(L, -2, (int)e + 1);
+      }
+      break;
+    }
+    case DT_INTROSPECTION_TYPE_STRUCT:
+    case DT_INTROSPECTION_TYPE_UNION:
+    {
+      dt_introspection_field_t **it =
+        (f->header.type == DT_INTROSPECTION_TYPE_STRUCT) ? f->Struct.fields : f->Union.fields;
+      lua_newtable(L);
+      for(; it && *it; it++)
+      {
+        dt_introspection_field_t *c = *it;
+        const char *cname = c->header.field_name;
+        if(!cname || !*cname) continue;
+        const void *cp = (const char *)p + (c->header.offset - f->header.offset);
+        decode_field(L, c, cp, depth + 1, TRUE);
+        lua_setfield(L, -2, cname);
+      }
+      break;
+    }
+    default:
+      decode_scalar(L, f, p, bare);
+      break;
+  }
+}
+
+/* Resolve the TOP-LEVEL params fields of a module = the children of the root
+   params struct (get_introspection()->field). The linear list from
+   get_introspection_linear() is a POST-ORDER flatten that ALSO contains every
+   composite's element/member descriptors (e.g. `tonecurve[0][0].x`,
+   `tonecurve[0]`) as separate dotted/bracketed leaves, so it is NOT the right
+   thing to iterate for a top-level field map. The root struct's `fields[]`
+   gives exactly the user-facing fields, each of which we then decode/encode
+   recursively. Returns the root STRUCT descriptor, or NULL. */
+static dt_introspection_field_t *root_struct(dt_iop_module_t *module)
+{
+  if(!module->so->get_introspection) return NULL;
+  dt_introspection_t *in = module->so->get_introspection();
+  if(!in || !in->field) return NULL;
+  if(in->field->header.type != DT_INTROSPECTION_TYPE_STRUCT) return NULL;
+  return in->field;
+}
+
+/* Find a top-level field by its public name among the root struct children. */
+static dt_introspection_field_t *find_toplevel(dt_iop_module_t *module, const char *name)
+{
+  dt_introspection_field_t *root = root_struct(module);
+  if(!root) return NULL;
+  for(dt_introspection_field_t **it = root->Struct.fields; it && *it; it++)
+  {
+    const char *k = (*it)->header.name ? (*it)->header.name : (*it)->header.field_name;
+    if(k && !g_strcmp0(k, name)) return *it;
+  }
+  return NULL;
 }
 
 /* darktable.develop.get_params(op, instance)
@@ -215,9 +370,9 @@ static int get_params_cb(lua_State *L)
   if(!module->have_introspection || !module->so || !module->params)
     return push_error(L, "module '%s' has no introspection", op);
 
-  dt_introspection_field_t *fields = module->so->get_introspection_linear();
-  if(!fields)
-    return push_error(L, "module '%s' introspection returned no fields", op);
+  dt_introspection_field_t *root = root_struct(module);
+  if(!root)
+    return push_error(L, "module '%s' introspection has no root struct", op);
 
   lua_newtable(L); // result
 
@@ -231,64 +386,18 @@ static int get_params_cb(lua_State *L)
   lua_newtable(L); // fields
   const char *const blob = (const char *)module->params;
 
-  for(dt_introspection_field_t *f = fields; f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+  // Iterate the TOP-LEVEL fields (root struct children), decoding each
+  // recursively. Scalars are decoded rich ({value,min,max,default}); ARRAY /
+  // STRUCT fields recurse into nested arrays/objects (see decode_field). This
+  // deliberately does NOT walk get_introspection_linear() -- that flat list
+  // also contains every composite's sub-element leaves (see root_struct note).
+  for(dt_introspection_field_t **it = root->Struct.fields; it && *it; it++)
   {
+    dt_introspection_field_t *f = *it;
     const char *key = f->header.name ? f->header.name : f->header.field_name;
     if(!key || !*key) continue;
     const void *p = blob + f->header.offset;
-
-    switch(f->header.type)
-    {
-      case DT_INTROSPECTION_TYPE_FLOAT:
-        push_num_field(L, *(const float *)p, f->Float.Min, f->Float.Max, f->Float.Default);
-        break;
-      case DT_INTROSPECTION_TYPE_DOUBLE:
-        push_num_field(L, *(const double *)p, f->Double.Min, f->Double.Max, f->Double.Default);
-        break;
-      case DT_INTROSPECTION_TYPE_INT:
-        push_int_field(L, *(const int *)p, f->Int.Min, f->Int.Max, f->Int.Default);
-        break;
-      case DT_INTROSPECTION_TYPE_UINT:
-        push_int_field(L, *(const unsigned int *)p, f->UInt.Min, f->UInt.Max, f->UInt.Default);
-        break;
-      case DT_INTROSPECTION_TYPE_BOOL:
-        // bare bool per §3.1
-        lua_pushboolean(L, *(const gboolean *)p);
-        break;
-      case DT_INTROSPECTION_TYPE_ENUM:
-      {
-        const int v = *(const int *)p;
-        lua_newtable(L);
-        lua_pushinteger(L, v);
-        lua_setfield(L, -2, "value");
-        const char *label = dt_introspection_get_enum_name(f, v);
-        lua_pushstring(L, label ? label : "");
-        lua_setfield(L, -2, "label");
-        lua_newtable(L); // options: all enum names, in declaration order
-        int oi = 1;
-        for(dt_introspection_type_enum_tuple_t *it = f->Enum.values; it && it->name; it++)
-        {
-          lua_pushstring(L, it->name);
-          lua_rawseti(L, -2, oi++);
-        }
-        lua_setfield(L, -2, "options");
-        break;
-      }
-      case DT_INTROSPECTION_TYPE_ARRAY:
-        push_placeholder(L, "array");
-        break;
-      case DT_INTROSPECTION_TYPE_STRUCT:
-        push_placeholder(L, "struct");
-        break;
-      case DT_INTROSPECTION_TYPE_UNION:
-        push_placeholder(L, "union");
-        break;
-      default:
-        // OPAQUE, CHAR, complex, and any other not-yet-decoded scalar type
-        push_placeholder(L, "opaque");
-        break;
-    }
-
+    decode_field(L, f, p, 0, FALSE);
     lua_setfield(L, -2, key);
   }
 
@@ -324,6 +433,184 @@ static void push_clamp_int(lua_State *L, int arr, int n, const char *field,
   lua_pushinteger(L, mn);     lua_setfield(L, -2, "min");
   lua_pushinteger(L, mx);     lua_setfield(L, -2, "max");
   lua_rawseti(L, arr, n);
+}
+
+/* Recursively ENCODE a Lua value at absolute stack index `vidx` into ANY
+   introspection field at blob pointer `p` (the set-side mirror of
+   decode_field; PLAN.md §3.1). Writes happen directly at computed offsets.
+
+   Shapes accepted (same as get emits):
+     scalar leaf : bare number / bool / enum(int|label). Clamped to the field's
+                   introspection Min/Max exactly like the top-level scalar path;
+                   each clamp appended to CLAMPED as {field=<path>,requested,
+                   applied,min,max}. An out-of-set enum is skipped (not written).
+     ARRAY       : a Lua array. Elements are written element-wise. A PARTIAL
+                   array is allowed (fewer elements than capacity -> the rest of
+                   the blob is left untouched), which is how a single curve
+                   channel is set without disturbing the others. OVER-CAPACITY
+                   is the guard (acceptance #4): if the caller supplies MORE
+                   elements than Array.count, only the first Array.count are
+                   written (never past the array -- no overflow) and one
+                   {field=<path>,requested=<n>,applied=<cap>,note="array capacity
+                   exceeded"} record is reported. A char[] target accepts a Lua
+                   string.
+     STRUCT/UNION: a Lua object. Only the members present in the table are
+                   written (missing members left untouched); child pointer is
+                   p + (child.offset - self.offset).
+
+   `path` is the dotted/bracketed field path used purely for clamp reporting
+   (e.g. "tonecurve[0][3].y"). Sets *wrote = TRUE if any leaf was written.
+   Depth-bounded by DT_LUA_DEVELOP_MAX_DEPTH. Never raises; a wrong-shaped value
+   (e.g. a number where an array is expected) is simply ignored. */
+static void encode_field(lua_State *L, dt_introspection_field_t *f, void *p, int vidx,
+                         int depth, const char *path, int CLAMPED, int *clamped_n,
+                         gboolean *wrote)
+{
+  luaL_checkstack(L, 8, "set_params encode");
+  if(depth > DT_LUA_DEVELOP_MAX_DEPTH) return;
+
+  switch(f->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_ARRAY:
+    {
+      // char[] target fed a Lua string: copy bytes (NUL-pad/truncate to cap).
+      if(f->Array.type == DT_INTROSPECTION_TYPE_CHAR && lua_type(L, vidx) == LUA_TSTRING)
+      {
+        size_t slen = 0;
+        const char *s = lua_tolstring(L, vidx, &slen);
+        const size_t cap = f->Array.count;
+        const size_t n = slen < cap ? slen : cap;
+        memcpy(p, s, n);
+        if(n < cap) ((char *)p)[n] = '\0';
+        *wrote = TRUE;
+        break;
+      }
+      if(lua_type(L, vidx) != LUA_TTABLE) break; // wrong shape -> ignore
+      const size_t provided = lua_rawlen(L, vidx);
+      const size_t cap = f->Array.count;
+      const size_t n = provided < cap ? provided : cap;
+      if(provided > cap)
+      {
+        // over-capacity guard: report, write only up to capacity.
+        lua_newtable(L);
+        lua_pushstring(L, path);                 lua_setfield(L, -2, "field");
+        lua_pushinteger(L, (lua_Integer)provided); lua_setfield(L, -2, "requested");
+        lua_pushinteger(L, (lua_Integer)cap);    lua_setfield(L, -2, "applied");
+        lua_pushstring(L, "array capacity exceeded"); lua_setfield(L, -2, "note");
+        lua_rawseti(L, CLAMPED, ++(*clamped_n));
+      }
+      for(size_t e = 0; e < n; e++)
+      {
+        dt_introspection_field_t *child = NULL;
+        void *ep = dt_introspection_access_array(f, p, (unsigned int)e, &child);
+        if(!ep || !child) continue;
+        lua_rawgeti(L, vidx, (int)e + 1);
+        const int evidx = lua_gettop(L);
+        if(!lua_isnil(L, evidx))
+        {
+          char *cp = g_strdup_printf("%s[%zu]", path, e);
+          encode_field(L, child, ep, evidx, depth + 1, cp, CLAMPED, clamped_n, wrote);
+          g_free(cp);
+        }
+        lua_pop(L, 1);
+      }
+      break;
+    }
+    case DT_INTROSPECTION_TYPE_STRUCT:
+    case DT_INTROSPECTION_TYPE_UNION:
+    {
+      if(lua_type(L, vidx) != LUA_TTABLE) break;
+      dt_introspection_field_t **it =
+        (f->header.type == DT_INTROSPECTION_TYPE_STRUCT) ? f->Struct.fields : f->Union.fields;
+      for(; it && *it; it++)
+      {
+        dt_introspection_field_t *c = *it;
+        const char *cname = c->header.field_name;
+        if(!cname || !*cname) continue;
+        lua_getfield(L, vidx, cname);
+        const int cvidx = lua_gettop(L);
+        if(!lua_isnil(L, cvidx))
+        {
+          void *cp = (char *)p + (c->header.offset - f->header.offset);
+          char *np = g_strdup_printf("%s.%s", path, cname);
+          encode_field(L, c, cp, cvidx, depth + 1, np, CLAMPED, clamped_n, wrote);
+          g_free(np);
+        }
+        lua_pop(L, 1);
+      }
+      break;
+    }
+    case DT_INTROSPECTION_TYPE_FLOAT:
+    {
+      const double req = lua_tonumber(L, vidx);
+      const double mn = f->Float.Min, mx = f->Float.Max;
+      double ap = req; gboolean cl = FALSE;
+      if(ap < mn) { ap = mn; cl = TRUE; }
+      if(ap > mx) { ap = mx; cl = TRUE; }
+      *(float *)p = (float)ap; *wrote = TRUE;
+      if(cl) push_clamp_num(L, CLAMPED, ++(*clamped_n), path, req, ap, mn, mx);
+      break;
+    }
+    case DT_INTROSPECTION_TYPE_DOUBLE:
+    {
+      const double req = lua_tonumber(L, vidx);
+      const double mn = f->Double.Min, mx = f->Double.Max;
+      double ap = req; gboolean cl = FALSE;
+      if(ap < mn) { ap = mn; cl = TRUE; }
+      if(ap > mx) { ap = mx; cl = TRUE; }
+      *(double *)p = ap; *wrote = TRUE;
+      if(cl) push_clamp_num(L, CLAMPED, ++(*clamped_n), path, req, ap, mn, mx);
+      break;
+    }
+    case DT_INTROSPECTION_TYPE_INT:
+    {
+      const lua_Integer req = (lua_Integer)llround(lua_tonumber(L, vidx));
+      const lua_Integer mn = f->Int.Min, mx = f->Int.Max;
+      lua_Integer ap = req; gboolean cl = FALSE;
+      if(ap < mn) { ap = mn; cl = TRUE; }
+      if(ap > mx) { ap = mx; cl = TRUE; }
+      *(int *)p = (int)ap; *wrote = TRUE;
+      if(cl) push_clamp_int(L, CLAMPED, ++(*clamped_n), path, req, ap, mn, mx);
+      break;
+    }
+    case DT_INTROSPECTION_TYPE_UINT:
+    {
+      const lua_Integer req = (lua_Integer)llround(lua_tonumber(L, vidx));
+      const lua_Integer mn = (lua_Integer)f->UInt.Min, mx = (lua_Integer)f->UInt.Max;
+      lua_Integer ap = req; gboolean cl = FALSE;
+      if(ap < mn) { ap = mn; cl = TRUE; }
+      if(ap > mx) { ap = mx; cl = TRUE; }
+      *(unsigned int *)p = (unsigned int)ap; *wrote = TRUE;
+      if(cl) push_clamp_int(L, CLAMPED, ++(*clamped_n), path, req, ap, mn, mx);
+      break;
+    }
+    case DT_INTROSPECTION_TYPE_BOOL:
+      *(gboolean *)p = lua_toboolean(L, vidx) ? 1 : 0; *wrote = TRUE;
+      break;
+    case DT_INTROSPECTION_TYPE_ENUM:
+    {
+      int val = 0; gboolean ok = FALSE;
+      if(lua_type(L, vidx) == LUA_TSTRING)
+        ok = dt_introspection_get_enum_value(f, lua_tostring(L, vidx), &val);
+      else if(lua_isnumber(L, vidx))
+      {
+        val = (int)lua_tointeger(L, vidx);
+        ok = (dt_introspection_get_enum_name(f, val) != NULL);
+      }
+      if(ok) { *(int *)p = val; *wrote = TRUE; }
+      else
+      {
+        lua_newtable(L);
+        lua_pushstring(L, path);                  lua_setfield(L, -2, "field");
+        lua_pushvalue(L, vidx);                   lua_setfield(L, -2, "requested");
+        lua_pushstring(L, "unknown enum value");  lua_setfield(L, -2, "note");
+        lua_rawseti(L, CLAMPED, ++(*clamped_n));
+      }
+      break;
+    }
+    default:
+      break; // opaque / complex nested leaf -> silently skip
+  }
 }
 
 /* darktable.develop.set_params(op, instance, {field=val, ...})
@@ -400,12 +687,11 @@ static int set_params_cb(lua_State *L)
     return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
 
   if(!module->have_introspection || !module->so || !module->params
-     || !module->so->get_introspection_linear || !module->so->get_p)
+     || !module->so->get_introspection || !module->so->get_p)
     return push_error(L, "module '%s' has no introspection", op);
 
-  dt_introspection_field_t *fields = module->so->get_introspection_linear();
-  if(!fields)
-    return push_error(L, "module '%s' introspection returned no fields", op);
+  if(!root_struct(module))
+    return push_error(L, "module '%s' introspection has no root struct", op);
 
   // Three result sub-tables kept at fixed ABSOLUTE stack indices for the whole
   // iteration, assembled into the final result only at the end. Keeping them
@@ -433,13 +719,9 @@ static int set_params_cb(lua_State *L)
     }
     const char *fname = lua_tostring(L, -2);
 
-    // locate the introspection field by the same key get_params exposes.
-    dt_introspection_field_t *fld = NULL;
-    for(dt_introspection_field_t *f = fields; f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
-    {
-      const char *k = f->header.name ? f->header.name : f->header.field_name;
-      if(k && !g_strcmp0(k, fname)) { fld = f; break; }
-    }
+    // Resolve against the TOP-LEVEL fields (root struct children), the same set
+    // get_params exposes -- never against the flattened linear leaves.
+    dt_introspection_field_t *fld = find_toplevel(module, fname);
     if(!fld)
     {
       lua_pushstring(L, fname);
@@ -448,10 +730,33 @@ static int set_params_cb(lua_State *L)
       continue;
     }
 
-    // Accept either a bare scalar/bool/string OR the object form {value=...}
-    // (get_params' read shape). If object, fetch .value onto the stack top and
-    // remember to pop it after use so the iteration value stays intact.
     const int vidx = lua_gettop(L); // the raw value lua_next returned
+
+    // COMPOSITE fields (array/struct/union incl. curves) are written by the
+    // recursive encoder against the field's blob base, then the post-write blob
+    // is decoded back as the "applied" value. Handled before the scalar-object
+    // unwrap because their value IS the array/object itself, not a {value=..}.
+    if(fld->header.type == DT_INTROSPECTION_TYPE_ARRAY
+       || fld->header.type == DT_INTROSPECTION_TYPE_STRUCT
+       || fld->header.type == DT_INTROSPECTION_TYPE_UNION)
+    {
+      void *base = (char *)module->params + fld->header.offset;
+      gboolean wrote = FALSE;
+      encode_field(L, fld, base, vidx, 0, fname, CLAMPED, &clamped_n, &wrote);
+      if(wrote)
+      {
+        any_written = TRUE;
+        decode_field(L, fld, base, 0, FALSE); // snapshot of the new value
+        lua_setfield(L, APPLIED, fname);
+      }
+      else { lua_pushstring(L, fname); lua_rawseti(L, UNKNOWN, ++unknown_n); }
+      lua_pop(L, 1); // drop the iteration value, keep key for lua_next
+      continue;
+    }
+
+    // Scalars: accept either a bare scalar/bool/string OR the object form
+    // {value=...} (get_params' read shape). If object, fetch .value onto the
+    // stack top and pop it after use so the iteration value stays intact.
     const gboolean is_obj = (lua_type(L, vidx) == LUA_TTABLE);
     int rvidx = vidx;
     if(is_obj)
@@ -582,9 +887,8 @@ static int set_params_cb(lua_State *L)
         break;
       }
       default:
-        // array/struct/union/opaque and other not-yet-writable scalar types:
-        // known field but this task cannot write it -> report as unknown so the
-        // caller sees it was ignored (full decode is a follow-up, PLAN.md §3.1).
+        // opaque / complex / other not-writable scalar leaf (ARRAY/STRUCT/UNION
+        // are handled above): known field but unwritable -> report as unknown.
         lua_pushstring(L, fname);
         lua_rawseti(L, UNKNOWN, ++unknown_n);
         break;
@@ -608,6 +912,143 @@ static int set_params_cb(lua_State *L)
   lua_pushvalue(L, APPLIED);  lua_setfield(L, -2, "applied");
   lua_pushvalue(L, CLAMPED);  lua_setfield(L, -2, "clamped");
   lua_pushvalue(L, UNKNOWN);  lua_setfield(L, -2, "unknown_fields");
+  return 1;
+}
+
+/* darktable.develop.dump_introspection(op, instance)
+   ------------------------------------------------------------------
+   Read-only diagnostic used to VERIFY empirically how get_introspection_linear()
+   represents composite (array/struct) fields (T1.7 investigation). Returns the
+   RAW flat linear list -- each entry's {name, field_name, type, type_name,
+   offset, size, array_count, array_elem_type} -- exactly as the generated
+   introspection emits it, plus the root struct's top-level child names. This is
+   what the report's "how the linear list represents composites" claim is based
+   on. Runs on the GUI thread (gtk_wrap). */
+static const char *_introspection_type_name(dt_introspection_type_t t)
+{
+  switch(t)
+  {
+    case DT_INTROSPECTION_TYPE_NONE: return "NONE";
+    case DT_INTROSPECTION_TYPE_OPAQUE: return "OPAQUE";
+    case DT_INTROSPECTION_TYPE_FLOAT: return "FLOAT";
+    case DT_INTROSPECTION_TYPE_DOUBLE: return "DOUBLE";
+    case DT_INTROSPECTION_TYPE_FLOATCOMPLEX: return "FLOATCOMPLEX";
+    case DT_INTROSPECTION_TYPE_CHAR: return "CHAR";
+    case DT_INTROSPECTION_TYPE_INT8: return "INT8";
+    case DT_INTROSPECTION_TYPE_UINT8: return "UINT8";
+    case DT_INTROSPECTION_TYPE_SHORT: return "SHORT";
+    case DT_INTROSPECTION_TYPE_USHORT: return "USHORT";
+    case DT_INTROSPECTION_TYPE_INT: return "INT";
+    case DT_INTROSPECTION_TYPE_UINT: return "UINT";
+    case DT_INTROSPECTION_TYPE_LONG: return "LONG";
+    case DT_INTROSPECTION_TYPE_ULONG: return "ULONG";
+    case DT_INTROSPECTION_TYPE_BOOL: return "BOOL";
+    case DT_INTROSPECTION_TYPE_ARRAY: return "ARRAY";
+    case DT_INTROSPECTION_TYPE_ENUM: return "ENUM";
+    case DT_INTROSPECTION_TYPE_STRUCT: return "STRUCT";
+    case DT_INTROSPECTION_TYPE_UNION: return "UNION";
+    default: return "?";
+  }
+}
+
+static int dump_introspection_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = NULL;
+  for(GList *iter = dev->iop; iter; iter = g_list_next(iter))
+  {
+    dt_iop_module_t *m = (dt_iop_module_t *)iter->data;
+    if(m && !g_strcmp0(m->op, op) && m->multi_priority == instance) { module = m; break; }
+  }
+  if(!module) return push_error(L, "no module '%s' instance %d", op, instance);
+  if(!module->have_introspection || !module->so || !module->so->get_introspection_linear)
+    return push_error(L, "module '%s' has no introspection", op);
+
+  lua_newtable(L); // result
+  lua_newtable(L); // linear[]
+  int i = 1;
+  for(dt_introspection_field_t *f = module->so->get_introspection_linear();
+      f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+  {
+    lua_newtable(L);
+    lua_pushstring(L, f->header.name ? f->header.name : "");        lua_setfield(L, -2, "name");
+    lua_pushstring(L, f->header.field_name ? f->header.field_name : ""); lua_setfield(L, -2, "field_name");
+    lua_pushstring(L, _introspection_type_name(f->header.type));    lua_setfield(L, -2, "type");
+    lua_pushstring(L, f->header.type_name ? f->header.type_name : ""); lua_setfield(L, -2, "type_name");
+    lua_pushinteger(L, (lua_Integer)f->header.offset);              lua_setfield(L, -2, "offset");
+    lua_pushinteger(L, (lua_Integer)f->header.size);                lua_setfield(L, -2, "size");
+    if(f->header.type == DT_INTROSPECTION_TYPE_ARRAY)
+    {
+      lua_pushinteger(L, (lua_Integer)f->Array.count);              lua_setfield(L, -2, "array_count");
+      lua_pushstring(L, _introspection_type_name(f->Array.type));   lua_setfield(L, -2, "array_elem_type");
+    }
+    lua_rawseti(L, -2, i++);
+  }
+  lua_setfield(L, -2, "linear");
+
+  // the top-level children (root struct), i.e. what get_params iterates.
+  lua_newtable(L);
+  dt_introspection_field_t *root = root_struct(module);
+  int j = 1;
+  if(root)
+    for(dt_introspection_field_t **it = root->Struct.fields; it && *it; it++)
+    {
+      lua_pushstring(L, (*it)->header.name ? (*it)->header.name : "");
+      lua_rawseti(L, -2, j++);
+    }
+  lua_setfield(L, -2, "top_level");
+  return 1;
+}
+
+/* darktable.develop.enable_module(op, instance, enabled)
+   ------------------------------------------------------------------
+   Toggle a module on/off and commit that as a history item (the minimal slice
+   of T1.4 needed so a freshly-written curve on a default-DISABLED module like
+   tonecurve actually affects the pipe -- set_params commits with the module's
+   CURRENT enabled flag, so the module must be enabled first). Runs on the GUI
+   thread (gtk_wrap), same threading contract as set_params.
+
+   dt_dev_add_history_item(dev, module, TRUE) sets module->enabled = TRUE
+   itself (develop.c:1246); the disable direction is not handled there, so we
+   set module->enabled explicitly before committing to cover both.
+   Returns {ok=true, op, instance, enabled=<bool>} or {error="..."}. */
+static int enable_module_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+  const gboolean want = lua_toboolean(L, 3);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = NULL;
+  for(GList *iter = dev->iop; iter; iter = g_list_next(iter))
+  {
+    dt_iop_module_t *m = (dt_iop_module_t *)iter->data;
+    if(m && !g_strcmp0(m->op, op) && m->multi_priority == instance)
+    {
+      module = m;
+      break;
+    }
+  }
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+
+  module->enabled = want;
+  dt_dev_add_history_item(dev, module, want);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);            lua_setfield(L, -2, "ok");
+  lua_pushstring(L, module->op);       lua_setfield(L, -2, "op");
+  lua_pushinteger(L, module->multi_priority); lua_setfield(L, -2, "instance");
+  lua_pushboolean(L, module->enabled); lua_setfield(L, -2, "enabled");
   return 1;
 }
 
@@ -1040,6 +1481,19 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "set_params");
+
+  // dump_introspection(op, instance): read-only diagnostic (T1.7 investigation).
+  lua_pushcfunction(L, dump_introspection_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "dump_introspection");
+
+  // enable_module(op, instance, bool): toggle a module + commit history. Writes
+  // live develop state via dt_dev_add_history_item -> MUST run on the GUI thread.
+  lua_pushcfunction(L, enable_module_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "enable_module");
 
   // history_count(): read-only diagnostic for coalescing observation.
   lua_pushcfunction(L, history_count_cb);
