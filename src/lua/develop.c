@@ -19,14 +19,22 @@
 #include "lua/develop.h"
 #include "common/darktable.h"
 #include "common/introspection.h"
+#include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/pixelpipe_hb.h"
 #include "lua/call.h"
 #include "lua/configuration.h"
+#include "lua/lua.h"
 #include "lua/types.h"
 #include <glib.h>
+#include <glib/gstdio.h>
 #include <math.h>
+#include <float.h>
+#include <png.h>
+#include <pthread.h>
 #include <stdarg.h>
+#include <string.h>
 
 // API contract version of the darktable.develop bindings. Bump whenever the
 // wire shapes (see PLAN.md §3.1) change so the bridge can refuse a mismatch.
@@ -411,6 +419,12 @@ static int set_params_cb(lua_State *L)
   lua_pushnil(L);
   while(lua_next(L, 3) != 0)
   {
+    // Make the per-field stack budget explicit (T1.3 review): each iteration
+    // may push a fetched .value, a clamp/unknown record table plus its several
+    // string/number members on top of the key/value already held. 8 slots
+    // covers the deepest path (enum clamp record) with margin; luaL_checkstack
+    // raises a clean Lua error rather than risking a silent overflow.
+    luaL_checkstack(L, 8, "set_params");
     // stack now: ..., key (-2), value (-1)
     if(lua_type(L, -2) != LUA_TSTRING)
     {
@@ -616,6 +630,385 @@ static int history_count_cb(lua_State *L)
   return 1;
 }
 
+/* ==========================================================================
+   darktable.develop.preview(max_w, max_h)
+   --------------------------------------------------------------------------
+   Encode a PNG of the CURRENT LIVE darkroom edit straight from the preview
+   pixelpipe's backbuffer -- WITHOUT writing anything to the DB/XMP. This is
+   the piece pure Lua could not do (T0.3 proved the export path reads the
+   COMMITTED DB history via a fresh dt_develop_t, not the live in-memory edit).
+   Together with set_params it closes the live conversational loop.
+
+   THREADING DESIGN (PLAN.md Risk #1 / §3.4 -- read before touching) ---------
+   The preview pixelpipe processes on a control WORKER thread
+   (dt_dev_process_preview -> dt_control_add_job_res(DT_CTL_WORKER_ZOOM_FILL),
+   develop.c:290-294), NOT on the GUI thread, and NOT on the Lua thread. The
+   worker fills pipe->backbuf under pipe->backbuf_mutex and flips pipe->status
+   to DT_DEV_PIXELPIPE_VALID at the very end of dt_dev_process_image_job
+   (develop.c:867, after the backbuf memcpy at pixelpipe_hb.c:3299). So:
+
+     * We DELIBERATELY do NOT register preview() wrapped in dt_lua_gtk_wrap.
+       Wrapping would marshal the WHOLE callback -- including the freshness
+       wait -- onto the GUI main thread and block it. A GUI-thread busy-wait
+       would starve the very main loop whose expose/redraw drives the worker
+       and, on a single flow, could stall waiting for a completion that the
+       blocked loop can no longer help deliver. Instead preview() runs on the
+       Lua thread and the WAIT is a bounded sleep-poll on the Lua thread
+       (dt_lua_unlock + g_usleep + dt_lua_lock, exactly like dt.control.sleep,
+       call.c:603): sleeping the Lua thread releases the Lua lock and never
+       touches the GUI main loop, so the GUI thread and the worker run freely
+       to completion while we wait.
+
+     * The ONE step that belongs on the GUI thread -- taking a consistent
+       snapshot of dev + deciding whether to (re)trigger the worker -- is
+       isolated in _run_on_gui_sync() (a minimal g_main_context_invoke_full +
+       GCond mirror of gtk_wrap, call.c:648). It releases the Lua lock while
+       blocked so the GUI thread can never be starved of it. The trampoline
+       itself touches no Lua state, so there is no lock inversion.
+
+     * The backbuf GRAB is done on the Lua thread directly under
+       pipe->backbuf_mutex -- that mutex IS the documented cross-thread
+       contract for backbuf (the GUI expose locks it in view.c:1944, the
+       worker locks it when writing, pixelpipe_hb.c:3278, and cleanup locks it
+       before freeing, pixelpipe_hb.c:389). We only ever hold backbuf_mutex,
+       memcpy out, and release -- a single lock, no nesting, so no deadlock and
+       no lock-ordering inversion. PNG encoding happens AFTER unlock, off-lock.
+
+   FRESHNESS SIGNAL (the key anti-stale guard) -----------------------------
+   set_params -> dt_dev_add_history_item -> dt_dev_invalidate_all
+   (develop.c:314) sets preview_pipe->status = DT_DEV_PIXELPIPE_DIRTY and does
+   dev->timestamp++ synchronously on the GUI thread. Every worker run stamps
+   pipe->input_timestamp = dev->timestamp at its START (develop.c:632) and only
+   reaches VALID at its END. So a frame is FRESH for the current edit iff
+     status == DT_DEV_PIXELPIPE_VALID && input_timestamp >= want_ts
+   where want_ts is dev->timestamp captured after the edit. A leftover VALID
+   from a pre-edit run has input_timestamp < want_ts and is correctly rejected
+   -- this is what prevents returning a stale (old-edit) preview. The reserved
+   job slot (jobs.c:353-385) guarantees our dt_dev_process_preview either
+   replaces a still-queued job or is queued behind a running one, so a fresh
+   run for want_ts is always scheduled even if a stale run is mid-flight.
+
+   RETURN (PLAN.md §3.4):
+     ok:        {status="ok", path=<png>, width=W, height=H}
+     timeout:   {status="processing", stale_preview=<path or absent>}
+     no image / not in darkroom / no backbuf yet: {error="..."}
+   ========================================================================== */
+
+/* Minimal "run this C function synchronously on the GUI main thread" helper,
+   used only for the small snapshot+trigger step of preview(). Modeled on
+   gtk_wrap (call.c:648): if already on the GUI thread, call inline; otherwise
+   invoke on the main context and block until done, releasing the Lua lock
+   across the wait so the GUI thread is never starved of it. */
+typedef struct
+{
+  GMutex m;
+  GCond c;
+  gboolean done;
+  void (*fn)(void *);
+  void *data;
+} dt_lua_gui_call_t;
+
+static gboolean _gui_call_trampoline(gpointer p)
+{
+  dt_lua_gui_call_t *g = (dt_lua_gui_call_t *)p;
+  g->fn(g->data);
+  g_mutex_lock(&g->m);
+  g->done = TRUE;
+  g_cond_signal(&g->c);
+  g_mutex_unlock(&g->m);
+  return G_SOURCE_REMOVE;
+}
+
+static void _run_on_gui_sync(void (*fn)(void *), void *data)
+{
+  if(pthread_equal(darktable.control->gui_thread, pthread_self()))
+  {
+    fn(data);
+    return;
+  }
+  dt_lua_gui_call_t g = { .done = FALSE, .fn = fn, .data = data };
+  g_mutex_init(&g.m);
+  g_cond_init(&g.c);
+  dt_lua_unlock();
+  g_main_context_invoke_full(NULL, G_PRIORITY_HIGH_IDLE, _gui_call_trampoline, &g, NULL);
+  g_mutex_lock(&g.m);
+  while(!g.done) g_cond_wait(&g.c, &g.m);
+  g_mutex_unlock(&g.m);
+  dt_lua_lock();
+  g_mutex_clear(&g.m);
+  g_cond_clear(&g.c);
+}
+
+/* GUI-thread snapshot + conditional (re)trigger of the preview worker. */
+typedef struct
+{
+  gboolean in_darkroom;      // out: dev in darkroom with an image loaded
+  int want_ts;               // out: dev->timestamp we require the frame to match
+  dt_dev_pixelpipe_t *pp;    // out: the preview pipe pointer (stable while in darkroom)
+} preview_snapshot_t;
+
+static void _preview_snapshot_gui(void *data)
+{
+  preview_snapshot_t *s = (preview_snapshot_t *)data;
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached || !dev->preview_pipe
+     || !dt_is_valid_imgid(dev->image_storage.id))
+  {
+    s->in_darkroom = FALSE;
+    return;
+  }
+  s->in_darkroom = TRUE;
+  s->pp = dev->preview_pipe;
+  s->want_ts = (int)dev->timestamp;
+  // Only kick a fresh worker if the current backbuf is not already a fresh
+  // VALID frame for this edit; avoids a redundant re-render on a plain
+  // (no preceding set_params) preview() call.
+  if(!(s->pp->status == DT_DEV_PIXELPIPE_VALID && s->pp->input_timestamp >= s->want_ts))
+    dt_dev_process_preview(dev);
+}
+
+/* Write an 8-bit RGB buffer (tightly packed, w*h*3) to a PNG file via libpng
+   (the same lib darktable already links, CMakeLists.txt:457). Returns TRUE on
+   success; on failure sets *err to a g_malloc'd message. */
+static gboolean _write_png_rgb(const char *path, const uint8_t *rgb, int w, int h, char **err)
+{
+  FILE *f = g_fopen(path, "wb");
+  if(!f) { if(err) *err = g_strdup_printf("cannot open '%s' for writing", path); return FALSE; }
+
+  png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if(!png) { fclose(f); if(err) *err = g_strdup("png_create_write_struct failed"); return FALSE; }
+  png_infop info = png_create_info_struct(png);
+  if(!info)
+  {
+    png_destroy_write_struct(&png, NULL);
+    fclose(f);
+    if(err) *err = g_strdup("png_create_info_struct failed");
+    return FALSE;
+  }
+  if(setjmp(png_jmpbuf(png)))
+  {
+    png_destroy_write_struct(&png, &info);
+    fclose(f);
+    if(err) *err = g_strdup("libpng encode error");
+    return FALSE;
+  }
+  png_init_io(png, f);
+  png_set_compression_level(png, 6);
+  png_set_IHDR(png, info, (png_uint_32)w, (png_uint_32)h, 8, PNG_COLOR_TYPE_RGB,
+               PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+  png_write_info(png, info);
+  for(int y = 0; y < h; y++)
+    png_write_row(png, (png_const_bytep)(rgb + (size_t)y * (size_t)w * 3));
+  png_write_end(png, info);
+  png_destroy_write_struct(&png, &info);
+  fclose(f);
+  return TRUE;
+}
+
+/* Box-average downscale (or 1:1 copy) of the backbuf into a packed 8-bit RGB
+   buffer of size tw*th*3, converting darktable's on-screen pixel order to RGB.
+
+   PIXEL ORDER: backbuf is wrapped verbatim by dt_view_create_surface() as
+   CAIRO_FORMAT_RGB24 (view.c:2080-2088). On little-endian that 32-bit format
+   stores each pixel as bytes [B, G, R, X] in memory. So per source pixel:
+   B = p[0], G = p[1], R = p[2], byte 3 unused. `src_stride` is the backbuf's
+   real row stride in bytes (backbuf_size / height == 4*width, matching cairo's
+   4-byte-aligned RGB24 stride). Returns a g_malloc'd RGB buffer (caller frees). */
+static uint8_t *_backbuf_to_rgb(const uint8_t *bb, int bw, int bh, size_t src_stride,
+                                int tw, int th)
+{
+  uint8_t *out = g_malloc((size_t)tw * (size_t)th * 3);
+  if(!out) return NULL;
+  for(int ty = 0; ty < th; ty++)
+  {
+    // source row span [sy0, sy1) for this target row
+    const int sy0 = (int)((int64_t)ty * bh / th);
+    int sy1 = (int)((int64_t)(ty + 1) * bh / th);
+    if(sy1 <= sy0) sy1 = sy0 + 1;
+    if(sy1 > bh) sy1 = bh;
+    for(int tx = 0; tx < tw; tx++)
+    {
+      const int sx0 = (int)((int64_t)tx * bw / tw);
+      int sx1 = (int)((int64_t)(tx + 1) * bw / tw);
+      if(sx1 <= sx0) sx1 = sx0 + 1;
+      if(sx1 > bw) sx1 = bw;
+
+      uint64_t rs = 0, gs = 0, bs = 0, n = 0;
+      for(int sy = sy0; sy < sy1; sy++)
+      {
+        const uint8_t *row = bb + (size_t)sy * src_stride;
+        for(int sx = sx0; sx < sx1; sx++)
+        {
+          const uint8_t *px = row + (size_t)sx * 4; // 4 bytes/px, BGRX
+          bs += px[0];
+          gs += px[1];
+          rs += px[2];
+          n++;
+        }
+      }
+      if(!n) n = 1;
+      uint8_t *o = out + ((size_t)ty * tw + tx) * 3;
+      o[0] = (uint8_t)(rs / n);
+      o[1] = (uint8_t)(gs / n);
+      o[2] = (uint8_t)(bs / n);
+    }
+  }
+  return out;
+}
+
+/* Compute the preview cache directory ($XDG_CACHE_HOME/darktable-mcp/
+   develop-previews via g_get_user_cache_dir, which honors XDG_CACHE_HOME ->
+   /run/cache-mcp inside the bridge container), creating it if needed. Returns
+   a g_malloc'd path, or NULL on failure. */
+static char *_preview_cache_dir(void)
+{
+  char *dir = g_build_filename(g_get_user_cache_dir(), "darktable-mcp", "develop-previews", NULL);
+  if(g_mkdir_with_parents(dir, 0700) != 0)
+  {
+    g_free(dir);
+    return NULL;
+  }
+  return dir;
+}
+
+/* Encode a captured backbuf copy to a fresh PNG in the cache dir. On success
+   pushes a g_malloc'd container path into out_path and sets out_w / out_h to
+   the encoded dimensions; returns TRUE. On failure sets *err (g_malloc'd). */
+static gboolean _encode_backbuf(const uint8_t *bb, int bw, int bh, size_t bufsize,
+                                int max_w, int max_h,
+                                char **out_path, int *out_w, int *out_h, char **err)
+{
+  if(bh <= 0 || bw <= 0) { if(err) *err = g_strdup("empty backbuf"); return FALSE; }
+  const size_t src_stride = bufsize / (size_t)bh; // == 4*bw for the RGB24 backbuf
+
+  // target dims: preserve aspect, downscale only (never upscale past backbuf).
+  int tw = bw, th = bh;
+  if(max_w > 0 || max_h > 0)
+  {
+    double sx = (max_w > 0) ? (double)max_w / (double)bw : DBL_MAX;
+    double sy = (max_h > 0) ? (double)max_h / (double)bh : DBL_MAX;
+    double s = MIN(sx, sy);
+    if(s > 1.0) s = 1.0; // no upscale beyond backbuf size
+    tw = (int)floor((double)bw * s);
+    th = (int)floor((double)bh * s);
+    if(tw < 1) tw = 1;
+    if(th < 1) th = 1;
+  }
+
+  uint8_t *rgb = _backbuf_to_rgb(bb, bw, bh, src_stride, tw, th);
+  if(!rgb) { if(err) *err = g_strdup("out of memory building rgb buffer"); return FALSE; }
+
+  char *dir = _preview_cache_dir();
+  if(!dir) { g_free(rgb); if(err) *err = g_strdup("cannot create preview cache dir"); return FALSE; }
+  char *fname = g_strdup_printf("preview-%" G_GINT64_FORMAT ".png", g_get_real_time());
+  char *path = g_build_filename(dir, fname, NULL);
+  g_free(dir);
+  g_free(fname);
+
+  const gboolean ok = _write_png_rgb(path, rgb, tw, th, err);
+  g_free(rgb);
+  if(!ok) { g_free(path); return FALSE; }
+
+  *out_path = path;
+  *out_w = tw;
+  *out_h = th;
+  return TRUE;
+}
+
+static int preview_cb(lua_State *L)
+{
+  const int max_w = luaL_optinteger(L, 1, 0);
+  const int max_h = luaL_optinteger(L, 2, 0);
+
+  // (a) GUI-thread snapshot + conditional (re)trigger of the preview worker.
+  preview_snapshot_t snap = { .in_darkroom = FALSE, .want_ts = 0, .pp = NULL };
+  _run_on_gui_sync(_preview_snapshot_gui, &snap);
+
+  if(!snap.in_darkroom || !snap.pp)
+    return push_error(L, "not in darkroom / no image loaded");
+
+  dt_dev_pixelpipe_t *pp = snap.pp;
+  const int want_ts = snap.want_ts;
+
+  // (b) bounded sleep-poll on the LUA thread for a FRESH VALID frame (§3.4
+  // timeout 2000 ms). Sleeping here releases the Lua lock and never touches the
+  // GUI main loop, so the GUI thread + worker run freely to completion.
+  const int timeout_ms = 2000;
+  const int step_ms = 15;
+  int waited = 0;
+  gboolean fresh = FALSE;
+  while(waited < timeout_ms)
+  {
+    if(pp->status == DT_DEV_PIXELPIPE_VALID && pp->input_timestamp >= want_ts)
+    {
+      fresh = TRUE;
+      break;
+    }
+    dt_lua_unlock();
+    g_usleep((gulong)step_ms * 1000);
+    dt_lua_lock();
+    waited += step_ms;
+  }
+
+  // (c) grab the backbuf under backbuf_mutex (the cross-thread contract), copy
+  // it out, release, then encode off-lock. We grab whatever VALID frame exists
+  // even on timeout so a stale (last-good) frame can be returned.
+  dt_pthread_mutex_lock(&pp->backbuf_mutex);
+  const uint8_t *bb = pp->backbuf;
+  const int bw = pp->backbuf_width;
+  const int bh = pp->backbuf_height;
+  const size_t bufsize = pp->backbuf_size;
+  uint8_t *copy = NULL;
+  if(bb && bw > 0 && bh > 0 && bufsize >= (size_t)4 * (size_t)bw * (size_t)bh)
+  {
+    copy = g_malloc(bufsize);
+    if(copy) memcpy(copy, bb, bufsize);
+  }
+  dt_pthread_mutex_unlock(&pp->backbuf_mutex);
+
+  if(!copy)
+  {
+    // Nothing ever rendered: distinguish from the timeout-with-stale case.
+    if(!fresh)
+      return push_error(L, "no preview backbuf yet (pipe not ready after %d ms)", timeout_ms);
+    return push_error(L, "preview pipe VALID but backbuf empty");
+  }
+
+  char *path = NULL;
+  int outw = 0, outh = 0, encret;
+  char *encerr = NULL;
+  encret = _encode_backbuf(copy, bw, bh, bufsize, max_w, max_h, &path, &outw, &outh, &encerr);
+  g_free(copy);
+
+  if(!encret)
+  {
+    char *m = encerr ? encerr : g_strdup("png encode failed");
+    push_error(L, "%s", m);
+    g_free(m);
+    return 1;
+  }
+
+  lua_newtable(L);
+  if(fresh)
+  {
+    // success: fresh frame of the current live edit.
+    lua_pushstring(L, "ok");   lua_setfield(L, -2, "status");
+    lua_pushstring(L, path);   lua_setfield(L, -2, "path");
+    lua_pushinteger(L, outw);  lua_setfield(L, -2, "width");
+    lua_pushinteger(L, outh);  lua_setfield(L, -2, "height");
+  }
+  else
+  {
+    // timed out waiting for the fresh pipe: return the last good frame.
+    lua_pushstring(L, "processing");   lua_setfield(L, -2, "status");
+    lua_pushstring(L, path);           lua_setfield(L, -2, "stale_preview");
+    lua_pushinteger(L, outw);          lua_setfield(L, -2, "width");
+    lua_pushinteger(L, outh);          lua_setfield(L, -2, "height");
+  }
+  g_free(path);
+  return 1;
+}
+
 int dt_lua_init_develop(lua_State *L)
 {
   dt_lua_push_darktable_lib(L);
@@ -653,6 +1046,16 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "history_count");
+
+  // preview(max_w, max_h): grabs the live preview_pipe backbuf and encodes a
+  // PNG, with NO DB write. Registered DELIBERATELY WITHOUT dt_lua_gtk_wrap:
+  // the freshness wait must NOT run on (and block) the GUI main loop -- it
+  // runs on the Lua thread as a bounded sleep-poll, and only the small
+  // snapshot+trigger step is marshaled onto the GUI thread internally via
+  // _run_on_gui_sync (see the long threading note on preview_cb above).
+  lua_pushcfunction(L, preview_cb);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "preview");
 
   return 0;
 }
