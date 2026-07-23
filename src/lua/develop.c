@@ -43,7 +43,12 @@
 // API 3 (T1.4): robust enable_module (forces a distinct history item + flushes
 // the pixelpipe cache via dt_dev_pixelpipe_rebuild to kill the enable/in-flight
 // -render cache-poison no-op race); adds add_instance(op).
-#define DT_LUA_DEVELOP_API 3
+// API 4 (FIX 1-3): set_params/enable_module now refresh the module GUI widgets
+// via dt_iop_gui_update after the commit (slider was stale); preview() accepts
+// an optional normalized region (x,y,w,h) to crop the backbuf before downscale
+// and echoes {frame_width,frame_height[,region]}; adds get_viewport() returning
+// the main + preview2 canvas zoom/pan state.
+#define DT_LUA_DEVELOP_API 4
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -922,7 +927,29 @@ static int set_params_cb(lua_State *L)
   // avoid churning an empty history entry. Pass module->enabled per PLAN.md
   // (set_params does NOT force-enable; toggling is enable_module's job, T1.4).
   if(any_written)
+  {
     dt_dev_add_history_item(dev, module, module->enabled);
+
+    // GUI WIDGET REFRESH (FIX 1). dt_dev_add_history_item commits params +
+    // reprocesses, but does NOT re-sync the module panel's bauhaus widgets --
+    // the slider keeps showing the OLD value until the module is reopened. We
+    // are already on the GUI thread (gtk_wrap), the only place GUI widget sets
+    // may run, so we re-push params into the widgets here.
+    //   * dt_iop_gui_update (imageop.c:2260) drives dt_bauhaus_update_from_field
+    //     + module->gui_update + blending/expander/header refresh -- all
+    //     synchronous GtkWidget/bauhaus sets. It does NOT call back into the
+    //     history-add path, so no re-entrancy into our just-released
+    //     history_mutex and no deadlock. It wraps its body in
+    //     DT_ENTER/LEAVE_GUI_UPDATE, but we run it AFTER the commit, so the
+    //     DT_IN_GUI_UPDATE guard in _dev_add_history_item never blocks our own
+    //     write (that already happened).
+    //   * Guard on module->expander: it is NULL until the darkroom expander is
+    //     built, so this is a safe no-op for a module whose GUI is not present
+    //     (headless/lighttable-adjacent). dt_iop_gui_update itself also
+    //     null-guards gui_data/header/off internally, making this belt-and-
+    //     suspenders.
+    if(module->expander) dt_iop_gui_update(module);
+  }
 
   // assemble the result table on top of the stack.
   lua_newtable(L);
@@ -1112,6 +1139,11 @@ static int enable_module_cb(lua_State *L)
   // 2. RACE FIX: rebuild topology + flush the pixelpipe cache (see note above).
   dt_dev_pixelpipe_rebuild(dev);
 
+  // 3. GUI WIDGET REFRESH (FIX 1): re-sync the on/off button + all module
+  //    widgets so the panel reflects the new enabled state immediately. Same
+  //    reasoning/guard as set_params (on the GUI thread, no history re-entry).
+  if(module->expander) dt_iop_gui_update(module);
+
   lua_newtable(L);
   lua_pushboolean(L, TRUE);            lua_setfield(L, -2, "ok");
   lua_pushstring(L, module->op);       lua_setfield(L, -2, "op");
@@ -1198,6 +1230,114 @@ static int history_count_cb(lua_State *L)
   lua_setfield(L, -2, "count");
   lua_pushinteger(L, dev->history_end);
   lua_setfield(L, -2, "history_end");
+  return 1;
+}
+
+/* Human-readable name for a dt_dev_zoom_t (settings.h:27). */
+static const char *_zoom_name(dt_dev_zoom_t z)
+{
+  switch(z)
+  {
+    case DT_ZOOM_FIT:          return "fit";
+    case DT_ZOOM_FILL:         return "fill";
+    case DT_ZOOM_1:            return "1:1";
+    case DT_ZOOM_FREE:         return "free";
+    case DT_ZOOM_POSITION:     return "position";
+    case DT_ZOOM_MOVE:         return "move";
+    case DT_ZOOM_SCROLL:       return "scroll";
+    case DT_ZOOM_FULL_PREVIEW: return "full_preview";
+    case DT_ZOOM_RESTORE:      return "restore";
+    default:                   return "?";
+  }
+}
+
+/* Push one viewport's zoom/pan descriptor as a table (FIX 3).
+   Uses the canonical accessors the darkroom GUI uses:
+     * dt_dev_get_viewport_params (develop.c:3446) reads zoom/closeup/zoom_x/
+       zoom_y under global_mutex; x/y are returned NORMALIZED and CENTERED --
+       0 = image center, roughly [-0.5,+0.5] toward each edge -- via the pipe's
+       distort transform (only when port->pipe is set, else left at 0).
+     * dt_dev_get_zoom_scale (develop.c:946) gives the effective on-screen pixel
+       scale (device px per processed px) for the current zoom mode; computed
+       only when port->pipe exists (it needs the processed size), else we fall
+       back to the raw stored port->zoom_scale.
+   Fields: {zoom=<int enum>, zoom_label, closeup, zoom_x, zoom_y, scale,
+            zoom_scale_raw}. Units documented above. Read-only. */
+static void _push_viewport(lua_State *L, dt_dev_viewport_t *port)
+{
+  dt_dev_zoom_t zoom = DT_ZOOM_FIT;
+  int closeup = 0;
+  float zx = 0.0f, zy = 0.0f;
+  dt_dev_get_viewport_params(port, &zoom, &closeup, &zx, &zy);
+
+  float scale = port->zoom_scale; // raw fallback when no pipe to size against
+  if(port->pipe)
+    scale = dt_dev_get_zoom_scale(port, zoom, 1 << closeup, FALSE);
+
+  lua_newtable(L);
+  lua_pushinteger(L, (lua_Integer)zoom);      lua_setfield(L, -2, "zoom");
+  lua_pushstring(L, _zoom_name(zoom));        lua_setfield(L, -2, "zoom_label");
+  lua_pushinteger(L, closeup);                lua_setfield(L, -2, "closeup");
+  lua_pushnumber(L, zx);                      lua_setfield(L, -2, "zoom_x");
+  lua_pushnumber(L, zy);                      lua_setfield(L, -2, "zoom_y");
+  lua_pushnumber(L, scale);                   lua_setfield(L, -2, "scale");
+  lua_pushnumber(L, port->zoom_scale);        lua_setfield(L, -2, "zoom_scale_raw");
+  lua_pushinteger(L, port->width);            lua_setfield(L, -2, "viewport_width");
+  lua_pushinteger(L, port->height);           lua_setfield(L, -2, "viewport_height");
+}
+
+/* darktable.develop.get_viewport()
+   ==========================================================================
+   Read-only snapshot of the darkroom CANVAS zoom/pan state so an agent can
+   render "what the user is actually looking at". Runs on the GUI thread
+   (gtk_wrap): the viewport fields are only ever mutated on the GUI thread and
+   dt_dev_get_viewport_params locks global_mutex internally, so this read is
+   consistent by construction.
+
+   Reports BOTH viewports darktable maintains (develop.h:356 `full, preview2`):
+     main     -- dev->full, the primary darkroom canvas (always present in
+                 darkroom).
+     preview2 -- dev->preview2, the SECOND (secondary/other-monitor) darkroom
+                 window. It only carries a live zoom/pan state while that window
+                 is OPEN. The open/active signal is dev->second_wnd /
+                 dev->preview2.widget, both set when the window is created
+                 (darkroom.c:5403/5426) and NULL'd when it is closed
+                 (darkroom.c:5334-5335). When inactive we still return the
+                 preview2 key with {active=false} and NO zoom fields, never an
+                 error.
+
+   Guard: not in darkroom (no dev / not gui_attached / no image) -> graceful
+   {error=...}, never a crash (acceptance: error in lighttable).
+
+   Return: {main={zoom,zoom_label,closeup,zoom_x,zoom_y,scale,...},
+            preview2={active=<bool>[, ...same fields when active]}}. */
+static int get_viewport_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached || !dt_is_valid_imgid(dev->image_storage.id))
+    return push_error(L, "not in darkroom / no image loaded");
+
+  lua_newtable(L); // result
+
+  // main canvas (dev->full) -- always present in darkroom.
+  _push_viewport(L, &dev->full);
+  lua_setfield(L, -2, "main");
+
+  // second window (dev->preview2) -- only live while the window is open.
+  const gboolean p2_active = (dev->second_wnd != NULL) && (dev->preview2.widget != NULL);
+  if(p2_active)
+  {
+    _push_viewport(L, &dev->preview2);       // pushes the descriptor table
+    lua_pushboolean(L, TRUE);
+    lua_setfield(L, -2, "active");           // add active=true onto it
+  }
+  else
+  {
+    lua_newtable(L);
+    lua_pushboolean(L, FALSE); lua_setfield(L, -2, "active");
+  }
+  lua_setfield(L, -2, "preview2");
+
   return 1;
 }
 
@@ -1376,8 +1516,15 @@ static gboolean _write_png_rgb(const char *path, const uint8_t *rgb, int w, int 
   return TRUE;
 }
 
-/* Box-average downscale (or 1:1 copy) of the backbuf into a packed 8-bit RGB
-   buffer of size tw*th*3, converting darktable's on-screen pixel order to RGB.
+/* Box-average downscale (or 1:1 copy) of a SUB-RECTANGLE of the backbuf into a
+   packed 8-bit RGB buffer of size tw*th*3, converting darktable's on-screen
+   pixel order to RGB.
+
+   REGION (FIX 2): [rx, ry, rw, rh] is the source crop rectangle in backbuf
+   pixel coords (rx,ry = top-left, rw x rh = size). The caller guarantees it is
+   fully inside [0,bw) x [0,bh). Full-frame is just rx=ry=0, rw=bw, rh=bh. The
+   rw x rh source area is box-downscaled to tw x th; source spans are computed
+   RELATIVE to the region and offset by (rx,ry) into the backbuf.
 
    PIXEL ORDER: backbuf is wrapped verbatim by dt_view_create_surface() as
    CAIRO_FORMAT_RGB24 (view.c:2080-2088). On little-endian that 32-bit format
@@ -1385,24 +1532,24 @@ static gboolean _write_png_rgb(const char *path, const uint8_t *rgb, int w, int 
    B = p[0], G = p[1], R = p[2], byte 3 unused. `src_stride` is the backbuf's
    real row stride in bytes (backbuf_size / height == 4*width, matching cairo's
    4-byte-aligned RGB24 stride). Returns a g_malloc'd RGB buffer (caller frees). */
-static uint8_t *_backbuf_to_rgb(const uint8_t *bb, int bw, int bh, size_t src_stride,
-                                int tw, int th)
+static uint8_t *_backbuf_to_rgb(const uint8_t *bb, int rx, int ry, int rw, int rh,
+                                size_t src_stride, int tw, int th)
 {
   uint8_t *out = g_malloc((size_t)tw * (size_t)th * 3);
   if(!out) return NULL;
   for(int ty = 0; ty < th; ty++)
   {
-    // source row span [sy0, sy1) for this target row
-    const int sy0 = (int)((int64_t)ty * bh / th);
-    int sy1 = (int)((int64_t)(ty + 1) * bh / th);
+    // source row span [sy0, sy1) WITHIN the region, then offset by ry.
+    const int sy0 = ry + (int)((int64_t)ty * rh / th);
+    int sy1 = ry + (int)((int64_t)(ty + 1) * rh / th);
     if(sy1 <= sy0) sy1 = sy0 + 1;
-    if(sy1 > bh) sy1 = bh;
+    if(sy1 > ry + rh) sy1 = ry + rh;
     for(int tx = 0; tx < tw; tx++)
     {
-      const int sx0 = (int)((int64_t)tx * bw / tw);
-      int sx1 = (int)((int64_t)(tx + 1) * bw / tw);
+      const int sx0 = rx + (int)((int64_t)tx * rw / tw);
+      int sx1 = rx + (int)((int64_t)(tx + 1) * rw / tw);
       if(sx1 <= sx0) sx1 = sx0 + 1;
-      if(sx1 > bw) sx1 = bw;
+      if(sx1 > rx + rw) sx1 = rx + rw;
 
       uint64_t rs = 0, gs = 0, bs = 0, n = 0;
       for(int sy = sy0; sy < sy1; sy++)
@@ -1446,27 +1593,34 @@ static char *_preview_cache_dir(void)
    pushes a g_malloc'd container path into out_path and sets out_w / out_h to
    the encoded dimensions; returns TRUE. On failure sets *err (g_malloc'd). */
 static gboolean _encode_backbuf(const uint8_t *bb, int bw, int bh, size_t bufsize,
+                                int rx, int ry, int rw, int rh,
                                 int max_w, int max_h,
                                 char **out_path, int *out_w, int *out_h, char **err)
 {
   if(bh <= 0 || bw <= 0) { if(err) *err = g_strdup("empty backbuf"); return FALSE; }
   const size_t src_stride = bufsize / (size_t)bh; // == 4*bw for the RGB24 backbuf
 
-  // target dims: preserve aspect, downscale only (never upscale past backbuf).
-  int tw = bw, th = bh;
+  // Region (FIX 2) in backbuf pixels; caller clamps to the backbuf. rw x rh is
+  // the source area we downscale from (full frame = 0,0,bw,bh). Aspect + the
+  // no-upscale rule are applied to the CROP dims, so a small region can render
+  // at up to its own 1:1 backbuf resolution (real detail) within max_w/max_h.
+  if(rw <= 0 || rh <= 0) { if(err) *err = g_strdup("empty region"); return FALSE; }
+
+  // target dims: preserve aspect, downscale only (never upscale past the crop).
+  int tw = rw, th = rh;
   if(max_w > 0 || max_h > 0)
   {
-    double sx = (max_w > 0) ? (double)max_w / (double)bw : DBL_MAX;
-    double sy = (max_h > 0) ? (double)max_h / (double)bh : DBL_MAX;
+    double sx = (max_w > 0) ? (double)max_w / (double)rw : DBL_MAX;
+    double sy = (max_h > 0) ? (double)max_h / (double)rh : DBL_MAX;
     double s = MIN(sx, sy);
-    if(s > 1.0) s = 1.0; // no upscale beyond backbuf size
-    tw = (int)floor((double)bw * s);
-    th = (int)floor((double)bh * s);
+    if(s > 1.0) s = 1.0; // no upscale beyond the cropped region's resolution
+    tw = (int)floor((double)rw * s);
+    th = (int)floor((double)rh * s);
     if(tw < 1) tw = 1;
     if(th < 1) th = 1;
   }
 
-  uint8_t *rgb = _backbuf_to_rgb(bb, bw, bh, src_stride, tw, th);
+  uint8_t *rgb = _backbuf_to_rgb(bb, rx, ry, rw, rh, src_stride, tw, th);
   if(!rgb) { if(err) *err = g_strdup("out of memory building rgb buffer"); return FALSE; }
 
   char *dir = _preview_cache_dir();
@@ -1490,6 +1644,35 @@ static int preview_cb(lua_State *L)
 {
   const int max_w = luaL_optinteger(L, 1, 0);
   const int max_h = luaL_optinteger(L, 2, 0);
+
+  // REGION (FIX 2): optional normalized sub-rectangle preview(max_w,max_h,x,y,w,h)
+  // with x,y,w,h in 0..1 of the VISIBLE (preview_pipe) frame -- x,y = top-left,
+  // w,h = size. Coordinates are relative to the downscaled full frame the pipe
+  // produced (backbuf_width/height), NOT the raw sensor image. When omitted we
+  // keep full-frame behavior. Validate+clamp the NORMALIZED region here (fast,
+  // before the render wait); it is mapped to backbuf pixels after the grab, once
+  // bw/bh are known. Degenerate (w<=0 / h<=0) -> graceful error, never a crash.
+  gboolean has_region = FALSE;
+  double nx = 0.0, ny = 0.0, nw = 1.0, nh = 1.0;
+  if(!lua_isnoneornil(L, 3) || !lua_isnoneornil(L, 4)
+     || !lua_isnoneornil(L, 5) || !lua_isnoneornil(L, 6))
+  {
+    if(!lua_isnumber(L, 3) || !lua_isnumber(L, 4)
+       || !lua_isnumber(L, 5) || !lua_isnumber(L, 6))
+      return push_error(L, "region requires four numbers: x, y, w, h in 0..1");
+    nx = lua_tonumber(L, 3); ny = lua_tonumber(L, 4);
+    nw = lua_tonumber(L, 5); nh = lua_tonumber(L, 6);
+    if(!(nw > 0.0) || !(nh > 0.0))
+      return push_error(L, "region w and h must be > 0 (got w=%g h=%g)", nw, nh);
+    // clamp origin to [0,1], then clamp size so the rect stays inside [0,1].
+    if(nx < 0.0) nx = 0.0;
+    if(nx > 1.0) nx = 1.0;
+    if(ny < 0.0) ny = 0.0;
+    if(ny > 1.0) ny = 1.0;
+    if(nw > 1.0 - nx) nw = 1.0 - nx;
+    if(nh > 1.0 - ny) nh = 1.0 - ny;
+    has_region = TRUE;
+  }
 
   // (a) GUI-thread snapshot + conditional (re)trigger of the preview worker.
   preview_snapshot_t snap = { .in_darkroom = FALSE, .want_ts = 0, .pp = NULL };
@@ -1545,10 +1728,32 @@ static int preview_cb(lua_State *L)
     return push_error(L, "preview pipe VALID but backbuf empty");
   }
 
+  // Map the NORMALIZED region (relative to the visible backbuf frame) to backbuf
+  // pixel coords. Full frame when no region was given. Round origin down / size
+  // to nearest, then clamp hard inside [0,bw) x [0,bh) so a boundary region can
+  // never read past the buffer; guarantee at least a 1px crop.
+  int rx = 0, ry = 0, rw = bw, rh = bh;
+  if(has_region)
+  {
+    rx = (int)floor(nx * bw);
+    ry = (int)floor(ny * bh);
+    rw = (int)llround(nw * bw);
+    rh = (int)llround(nh * bh);
+    if(rx < 0) rx = 0;
+    if(rx > bw - 1) rx = bw - 1;
+    if(ry < 0) ry = 0;
+    if(ry > bh - 1) ry = bh - 1;
+    if(rw < 1) rw = 1;
+    if(rx + rw > bw) rw = bw - rx;
+    if(rh < 1) rh = 1;
+    if(ry + rh > bh) rh = bh - ry;
+  }
+
   char *path = NULL;
   int outw = 0, outh = 0, encret;
   char *encerr = NULL;
-  encret = _encode_backbuf(copy, bw, bh, bufsize, max_w, max_h, &path, &outw, &outh, &encerr);
+  encret = _encode_backbuf(copy, bw, bh, bufsize, rx, ry, rw, rh, max_w, max_h,
+                           &path, &outw, &outh, &encerr);
   g_free(copy);
 
   if(!encret)
@@ -1575,6 +1780,23 @@ static int preview_cb(lua_State *L)
     lua_pushstring(L, path);           lua_setfield(L, -2, "stale_preview");
     lua_pushinteger(L, outw);          lua_setfield(L, -2, "width");
     lua_pushinteger(L, outh);          lua_setfield(L, -2, "height");
+  }
+  // Echo the frame + (when cropped) the region actually rendered, in both
+  // normalized and backbuf-pixel terms, so a caller can verify the crop.
+  lua_pushinteger(L, bw); lua_setfield(L, -2, "frame_width");
+  lua_pushinteger(L, bh); lua_setfield(L, -2, "frame_height");
+  if(has_region)
+  {
+    lua_newtable(L);
+    lua_pushnumber(L, nx); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, ny); lua_setfield(L, -2, "y");
+    lua_pushnumber(L, nw); lua_setfield(L, -2, "w");
+    lua_pushnumber(L, nh); lua_setfield(L, -2, "h");
+    lua_pushinteger(L, rx); lua_setfield(L, -2, "px_x");
+    lua_pushinteger(L, ry); lua_setfield(L, -2, "px_y");
+    lua_pushinteger(L, rw); lua_setfield(L, -2, "px_w");
+    lua_pushinteger(L, rh); lua_setfield(L, -2, "px_h");
+    lua_setfield(L, -2, "region");
   }
   g_free(path);
   return 1;
@@ -1638,6 +1860,13 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "history_count");
+
+  // get_viewport(): read-only darkroom canvas zoom/pan (main + preview2). Reads
+  // live viewport state (global_mutex internally) -> run on the GUI thread.
+  lua_pushcfunction(L, get_viewport_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "get_viewport");
 
   // preview(max_w, max_h): grabs the live preview_pipe backbuf and encodes a
   // PNG, with NO DB write. Registered DELIBERATELY WITHOUT dt_lua_gtk_wrap:
