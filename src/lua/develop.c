@@ -25,6 +25,7 @@
 #include "lua/configuration.h"
 #include "lua/types.h"
 #include <glib.h>
+#include <math.h>
 #include <stdarg.h>
 
 // API contract version of the darktable.develop bindings. Bump whenever the
@@ -287,6 +288,334 @@ static int get_params_cb(lua_State *L)
   return 1;
 }
 
+/* Append one clamp record {field,requested,applied,min,max} (numeric bounds)
+   to the array table sitting at absolute stack index `arr`, at position `n`.
+   Pushes a fresh table and pops it via lua_rawseti, leaving the stack as it
+   was found. */
+static void push_clamp_num(lua_State *L, int arr, int n, const char *field,
+                           double req, double ap, double mn, double mx)
+{
+  lua_newtable(L);
+  lua_pushstring(L, field);  lua_setfield(L, -2, "field");
+  lua_pushnumber(L, req);    lua_setfield(L, -2, "requested");
+  lua_pushnumber(L, ap);     lua_setfield(L, -2, "applied");
+  lua_pushnumber(L, mn);     lua_setfield(L, -2, "min");
+  lua_pushnumber(L, mx);     lua_setfield(L, -2, "max");
+  lua_rawseti(L, arr, n);
+}
+
+/* Integer-typed clamp record (requested/applied/min/max as Lua integers so
+   they JSON-encode as plain ints). */
+static void push_clamp_int(lua_State *L, int arr, int n, const char *field,
+                           lua_Integer req, lua_Integer ap, lua_Integer mn, lua_Integer mx)
+{
+  lua_newtable(L);
+  lua_pushstring(L, field);   lua_setfield(L, -2, "field");
+  lua_pushinteger(L, req);    lua_setfield(L, -2, "requested");
+  lua_pushinteger(L, ap);     lua_setfield(L, -2, "applied");
+  lua_pushinteger(L, mn);     lua_setfield(L, -2, "min");
+  lua_pushinteger(L, mx);     lua_setfield(L, -2, "max");
+  lua_rawseti(L, arr, n);
+}
+
+/* darktable.develop.set_params(op, instance, {field=val, ...})
+   ------------------------------------------------------------------
+   Write one or more scalar/bool/enum fields into the live params blob of the
+   module `op` at multi-instance `instance` (== multi_priority, see
+   INSTANCE-KEY CONVENTION), clamp each numeric value to its introspection
+   Min/Max, then commit the change to history and trigger a live reprocess.
+
+   THREADING / LOCKING REASONING (Risk #1 in PLAN.md -- the whole point of
+   this task; read before touching):
+     * This callback is registered wrapped in dt_lua_gtk_wrap() (see
+       dt_lua_init_develop below). gtk_wrap marshals the ENTIRE callback onto
+       darktable's GUI main thread and blocks the calling Lua thread until it
+       returns. Therefore every line here runs ON THE GUI THREAD.
+     * dt_dev_add_history_item() (develop.c:1445) is the GUI commit path. Its
+       internal _dev_add_history_item (develop.c:1382) acquires
+       dev->history_mutex itself (develop.c:1399) and releases it
+       (develop.c:1424) BEFORE raising any signal / queueing the redraw. It
+       must run on the GUI thread and must NOT be called while the caller
+       already holds history_mutex.
+     * We satisfy both invariants by construction: we are already on the GUI
+       thread (gtk_wrap), and we NEVER take history_mutex ourselves -- we only
+       touch module->params (plain memory writes, same as a slider's value
+       callback does before committing) and then hand off to
+       dt_dev_add_history_item, which owns the lock for the whole critical
+       section. No lock is held across the call, so no lock-ordering inversion
+       and no double-lock is possible. We also do NOT nest another
+       dt_lua_gtk_wrap and do NOT g_main_context_invoke -- doing so from the
+       GUI thread would deadlock waiting on the main loop we are running on.
+     * DT_IN_GUI_UPDATE() guard (develop.c:1388): _dev_add_history_item
+       early-returns (does nothing) if !darktable.gui || DT_IN_GUI_UPDATE().
+       DT_IN_GUI_UPDATE() is true only inside a DT_ENTER_GUI_UPDATE/LEAVE
+       region (a widget being programmatically synced). Our gtk_wrap callback
+       runs directly off the main loop, not inside such a region, so the guard
+       passes and the write is committed. If a future change makes the commit
+       silently no-op, this guard is the first suspect -- surface it, do not
+       work around it.
+
+   Params are written directly through the module's generated
+   so->get_p(module->params, name) pointer, cast by the field's introspection
+   type -- the SAME name/offset contract get_params() reads, so a
+   set_params -> get_params round-trip is consistent by construction.
+
+   Return (PLAN.md §3.2): {ok=true, applied={f=v,...},
+     clamped={{field,requested,applied,min,max}, ...},
+     unknown_fields={...}}. Out-of-range values are clamped and reported,
+   never rejected. Unknown field names are ignored and listed. An out-of-set
+   enum value is reported (with a note) and NOT written (no garbage). Unknown
+   module / not-in-darkroom / no-introspection -> {error="..."}. */
+static int set_params_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+  luaL_checktype(L, 3, LUA_TTABLE);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  // Match on op AND multi_priority (the public instance key), like get_params.
+  dt_iop_module_t *module = NULL;
+  for(GList *iter = dev->iop; iter; iter = g_list_next(iter))
+  {
+    dt_iop_module_t *m = (dt_iop_module_t *)iter->data;
+    if(m && !g_strcmp0(m->op, op) && m->multi_priority == instance)
+    {
+      module = m;
+      break;
+    }
+  }
+
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+
+  if(!module->have_introspection || !module->so || !module->params
+     || !module->so->get_introspection_linear || !module->so->get_p)
+    return push_error(L, "module '%s' has no introspection", op);
+
+  dt_introspection_field_t *fields = module->so->get_introspection_linear();
+  if(!fields)
+    return push_error(L, "module '%s' introspection returned no fields", op);
+
+  // Three result sub-tables kept at fixed ABSOLUTE stack indices for the whole
+  // iteration, assembled into the final result only at the end. Keeping them
+  // below the lua_next key/value pair keeps the iteration stack disciplined.
+  lua_newtable(L); const int APPLIED = lua_gettop(L);
+  lua_newtable(L); const int CLAMPED = lua_gettop(L);
+  lua_newtable(L); const int UNKNOWN = lua_gettop(L);
+  int clamped_n = 0, unknown_n = 0;
+  gboolean any_written = FALSE;
+
+  lua_pushnil(L);
+  while(lua_next(L, 3) != 0)
+  {
+    // stack now: ..., key (-2), value (-1)
+    if(lua_type(L, -2) != LUA_TSTRING)
+    {
+      lua_pop(L, 1); // drop value, keep key for next lua_next
+      continue;
+    }
+    const char *fname = lua_tostring(L, -2);
+
+    // locate the introspection field by the same key get_params exposes.
+    dt_introspection_field_t *fld = NULL;
+    for(dt_introspection_field_t *f = fields; f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
+    {
+      const char *k = f->header.name ? f->header.name : f->header.field_name;
+      if(k && !g_strcmp0(k, fname)) { fld = f; break; }
+    }
+    if(!fld)
+    {
+      lua_pushstring(L, fname);
+      lua_rawseti(L, UNKNOWN, ++unknown_n);
+      lua_pop(L, 1); // drop value, keep key
+      continue;
+    }
+
+    // Accept either a bare scalar/bool/string OR the object form {value=...}
+    // (get_params' read shape). If object, fetch .value onto the stack top and
+    // remember to pop it after use so the iteration value stays intact.
+    const int vidx = lua_gettop(L); // the raw value lua_next returned
+    const gboolean is_obj = (lua_type(L, vidx) == LUA_TTABLE);
+    int rvidx = vidx;
+    if(is_obj)
+    {
+      lua_getfield(L, vidx, "value");
+      rvidx = lua_gettop(L);
+    }
+
+    switch(fld->header.type)
+    {
+      case DT_INTROSPECTION_TYPE_FLOAT:
+      {
+        const double req = lua_tonumber(L, rvidx);
+        const double mn = fld->Float.Min, mx = fld->Float.Max;
+        double ap = req; gboolean cl = FALSE;
+        if(ap < mn) { ap = mn; cl = TRUE; }
+        if(ap > mx) { ap = mx; cl = TRUE; }
+        float *wp = (float *)module->so->get_p(module->params, fname);
+        if(wp)
+        {
+          *wp = (float)ap;
+          any_written = TRUE;
+          lua_pushnumber(L, ap); lua_setfield(L, APPLIED, fname);
+          if(cl) push_clamp_num(L, CLAMPED, ++clamped_n, fname, req, ap, mn, mx);
+        }
+        else { lua_pushstring(L, fname); lua_rawseti(L, UNKNOWN, ++unknown_n); }
+        break;
+      }
+      case DT_INTROSPECTION_TYPE_DOUBLE:
+      {
+        const double req = lua_tonumber(L, rvidx);
+        const double mn = fld->Double.Min, mx = fld->Double.Max;
+        double ap = req; gboolean cl = FALSE;
+        if(ap < mn) { ap = mn; cl = TRUE; }
+        if(ap > mx) { ap = mx; cl = TRUE; }
+        double *wp = (double *)module->so->get_p(module->params, fname);
+        if(wp)
+        {
+          *wp = ap;
+          any_written = TRUE;
+          lua_pushnumber(L, ap); lua_setfield(L, APPLIED, fname);
+          if(cl) push_clamp_num(L, CLAMPED, ++clamped_n, fname, req, ap, mn, mx);
+        }
+        else { lua_pushstring(L, fname); lua_rawseti(L, UNKNOWN, ++unknown_n); }
+        break;
+      }
+      case DT_INTROSPECTION_TYPE_INT:
+      {
+        const lua_Integer req = (lua_Integer)llround(lua_tonumber(L, rvidx));
+        const lua_Integer mn = fld->Int.Min, mx = fld->Int.Max;
+        lua_Integer ap = req; gboolean cl = FALSE;
+        if(ap < mn) { ap = mn; cl = TRUE; }
+        if(ap > mx) { ap = mx; cl = TRUE; }
+        int *wp = (int *)module->so->get_p(module->params, fname);
+        if(wp)
+        {
+          *wp = (int)ap;
+          any_written = TRUE;
+          lua_pushinteger(L, ap); lua_setfield(L, APPLIED, fname);
+          if(cl) push_clamp_int(L, CLAMPED, ++clamped_n, fname, req, ap, mn, mx);
+        }
+        else { lua_pushstring(L, fname); lua_rawseti(L, UNKNOWN, ++unknown_n); }
+        break;
+      }
+      case DT_INTROSPECTION_TYPE_UINT:
+      {
+        const lua_Integer req = (lua_Integer)llround(lua_tonumber(L, rvidx));
+        const lua_Integer mn = (lua_Integer)fld->UInt.Min, mx = (lua_Integer)fld->UInt.Max;
+        lua_Integer ap = req; gboolean cl = FALSE;
+        if(ap < mn) { ap = mn; cl = TRUE; }
+        if(ap > mx) { ap = mx; cl = TRUE; }
+        unsigned int *wp = (unsigned int *)module->so->get_p(module->params, fname);
+        if(wp)
+        {
+          *wp = (unsigned int)ap;
+          any_written = TRUE;
+          lua_pushinteger(L, ap); lua_setfield(L, APPLIED, fname);
+          if(cl) push_clamp_int(L, CLAMPED, ++clamped_n, fname, req, ap, mn, mx);
+        }
+        else { lua_pushstring(L, fname); lua_rawseti(L, UNKNOWN, ++unknown_n); }
+        break;
+      }
+      case DT_INTROSPECTION_TYPE_BOOL:
+      {
+        const int b = lua_toboolean(L, rvidx) ? 1 : 0; // coerce to 0/1
+        gboolean *wp = (gboolean *)module->so->get_p(module->params, fname);
+        if(wp)
+        {
+          *wp = b;
+          any_written = TRUE;
+          lua_pushboolean(L, b); lua_setfield(L, APPLIED, fname);
+        }
+        else { lua_pushstring(L, fname); lua_rawseti(L, UNKNOWN, ++unknown_n); }
+        break;
+      }
+      case DT_INTROSPECTION_TYPE_ENUM:
+      {
+        // accept the integer value OR the symbolic label string; reject (report
+        // + do not write) any value not in the enum set.
+        int val = 0; gboolean ok = FALSE;
+        if(lua_type(L, rvidx) == LUA_TSTRING)
+          ok = dt_introspection_get_enum_value(fld, lua_tostring(L, rvidx), &val);
+        else if(lua_isnumber(L, rvidx))
+        {
+          val = (int)lua_tointeger(L, rvidx);
+          ok = (dt_introspection_get_enum_name(fld, val) != NULL);
+        }
+        if(ok)
+        {
+          int *wp = (int *)module->so->get_p(module->params, fname);
+          if(wp)
+          {
+            *wp = val;
+            any_written = TRUE;
+            lua_pushinteger(L, val); lua_setfield(L, APPLIED, fname);
+          }
+          else { lua_pushstring(L, fname); lua_rawseti(L, UNKNOWN, ++unknown_n); }
+        }
+        else
+        {
+          // out-of-set enum -> clamp report with a note, NOT written.
+          lua_newtable(L);
+          lua_pushstring(L, fname);              lua_setfield(L, -2, "field");
+          lua_pushvalue(L, rvidx);               lua_setfield(L, -2, "requested");
+          lua_pushstring(L, "unknown enum value"); lua_setfield(L, -2, "note");
+          lua_rawseti(L, CLAMPED, ++clamped_n);
+        }
+        break;
+      }
+      default:
+        // array/struct/union/opaque and other not-yet-writable scalar types:
+        // known field but this task cannot write it -> report as unknown so the
+        // caller sees it was ignored (full decode is a follow-up, PLAN.md §3.1).
+        lua_pushstring(L, fname);
+        lua_rawseti(L, UNKNOWN, ++unknown_n);
+        break;
+    }
+
+    if(is_obj) lua_pop(L, 1); // drop the fetched .value
+    lua_pop(L, 1);            // drop the iteration value, keep key for lua_next
+  }
+
+  // COMMIT + LIVE REPROCESS. We are on the GUI thread (gtk_wrap); this call
+  // takes and releases dev->history_mutex internally and invalidates the pipe.
+  // Skip it entirely if nothing was actually written (all fields unknown), to
+  // avoid churning an empty history entry. Pass module->enabled per PLAN.md
+  // (set_params does NOT force-enable; toggling is enable_module's job, T1.4).
+  if(any_written)
+    dt_dev_add_history_item(dev, module, module->enabled);
+
+  // assemble the result table on top of the stack.
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);   lua_setfield(L, -2, "ok");
+  lua_pushvalue(L, APPLIED);  lua_setfield(L, -2, "applied");
+  lua_pushvalue(L, CLAMPED);  lua_setfield(L, -2, "clamped");
+  lua_pushvalue(L, UNKNOWN);  lua_setfield(L, -2, "unknown_fields");
+  return 1;
+}
+
+/* darktable.develop.history_count()
+   Read-only diagnostic: {count=<g_list_length(dev->history)>,
+   history_end=<dev->history_end>}. Used to observe native history coalescing
+   (PLAN.md §3.3) without scraping logs. Reads live develop state on the GUI
+   thread (gtk_wrap); history length is only ever mutated on the GUI thread, so
+   the read needs no extra lock. */
+static int history_count_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(!dev)
+    return push_error(L, "no darkroom image loaded");
+  lua_newtable(L);
+  lua_pushinteger(L, dev->history ? (lua_Integer)g_list_length(dev->history) : 0);
+  lua_setfield(L, -2, "count");
+  lua_pushinteger(L, dev->history_end);
+  lua_setfield(L, -2, "history_end");
+  return 1;
+}
+
 int dt_lua_init_develop(lua_State *L)
 {
   dt_lua_push_darktable_lib(L);
@@ -310,6 +639,20 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "get_params");
+
+  // set_params(op, instance, {..}): writes live params + commits history via
+  // dt_dev_add_history_item -> MUST run on the GUI thread (see the long
+  // threading note on set_params_cb). gtk_wrap gives us exactly that.
+  lua_pushcfunction(L, set_params_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "set_params");
+
+  // history_count(): read-only diagnostic for coalescing observation.
+  lua_pushcfunction(L, history_count_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "history_count");
 
   return 0;
 }
