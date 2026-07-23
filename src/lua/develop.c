@@ -20,8 +20,10 @@
 #include "common/darktable.h"
 #include "common/introspection.h"
 #include "control/control.h"
+#include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/masks.h"
 #include "develop/pixelpipe_hb.h"
 #include "lua/call.h"
 #include "lua/configuration.h"
@@ -48,7 +50,11 @@
 // an optional normalized region (x,y,w,h) to crop the backbuf before downscale
 // and echoes {frame_width,frame_height[,region]}; adds get_viewport() returning
 // the main + preview2 canvas zoom/pan state.
-#define DT_LUA_DEVELOP_API 4
+// API 5 (T2.2): adds add_path_mask(op, instance, points, opacity[, feather]) --
+// builds a DT_MASKS_PATH form from a normalized polygon, wires it to the
+// module's blend group via dt_masks_gui_form_save_creation, and turns on the
+// drawn-mask blend mode so the module's effect is restricted to the region.
+#define DT_LUA_DEVELOP_API 5
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -1802,6 +1808,192 @@ static int preview_cb(lua_State *L)
   return 1;
 }
 
+/* darktable.develop.add_path_mask(op, instance, points, opacity[, feather])
+   ==========================================================================
+   Build a DRAWN PATH mask (DT_MASKS_PATH) from a normalized polygon and attach
+   it to the module's blend group so the module's effect is RESTRICTED to that
+   region. This is the C core of Phase 2 (object masks). Runs on the GUI thread
+   (registered wrapped in dt_lua_gtk_wrap): it mutates dev->forms, the module's
+   blend group, blend_params and the history stack, all GUI-thread state, and
+   commits via dt_dev_add_masks_history_item / dt_dev_add_history_item, whose
+   locking contract (see set_params_cb) requires the GUI thread.
+
+   ARGS
+     op        module operation name (e.g. "exposure").
+     instance  multi_priority (PUBLIC instance key, see INSTANCE-KEY CONVENTION).
+     points    Lua array of {x=..,y=..}, normalized 0..1 image coords, in polygon
+               order. Requires >= 3 points; each is clamped to [0,1]. A missing
+               table / non-numeric x or y is MALFORMED -> graceful {error}, never
+               a crash (acceptance #4).
+     opacity   0..1 mask opacity (default 1.0, clamped).
+     feather   optional border half-width in normalized coords (default 0.005,
+               clamped [0,0.5]); floored at 0.0005 like the GUI path (path.c:3046).
+
+   NODE BUILD (mirrors path.c:3035-3070, but for a POLYGON) -----------------
+   Each node is a dt_masks_point_path_t with corner = {x,y}. The GUI's freehand
+   creation stores ctrl1/ctrl2 = -1 as an "auto bezier" sentinel that a LATER
+   call to the static _path_init_ctrl_points() resolves via catmull-rom. But the
+   mask evaluation path used by blending -- _path_get_pts_border() (path.c:1413,
+   reached through dt_masks_get_points_border) -- does NOT call that resolver; it
+   consumes ctrl1/ctrl2 verbatim. So injecting -1 sentinels would feed -1 as a
+   literal control coordinate and produce garbage. We therefore write EXPLICIT
+   control points: ctrl1 = ctrl2 = corner with state = DT_MASKS_POINT_STATE_USER
+   (a "sharp" node, path.c:3076). Every bezier segment then degenerates to a
+   straight edge between successive corners -> a faithful polygon, self-contained
+   with no dependency on the static resolver. border[0]=border[1]=feather.
+
+   WIRING (what save_creation does vs what we set) --------------------------
+   dt_masks_gui_form_save_creation(dev, module, form, NULL) (masks.c:370):
+     * names the form, appends it to dev->forms, calls dt_dev_add_masks_history;
+     * if the module has no mask group yet, _group_create() (masks.c:307) makes
+       one AND sets module->blend_params->mask_id = grp->formid for us;
+     * appends a dt_masks_point_group_t {formid, state=SHOW|USE, opacity=conf}
+       to the group and adds a second masks-history item.
+   It does NOT touch blend_params->mask_mode. So AFTER save_creation we:
+     (a) override the group point's opacity to the requested value (save_creation
+         seeds it from the "plugins/darkroom/masks/opacity" conf) and re-add a
+         masks-history item so the change is captured;
+     (b) set blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+         -- BOTH bits, exactly like the GUI drawn-mask toggle
+         (blend_gui.c:1507); DEVELOP_MASK_MASK (1<<1) alone does not enable
+         blending, DEVELOP_MASK_ENABLED (1) is the master gate;
+     (c) commit blend_params + trigger a live reprocess via
+         dt_dev_add_history_item(dev, module, module->enabled) -- the same call
+         the GUI mode combo ends with (blend_gui.c end of
+         _blendop_masks_mode_callback). This invalidates the pipe so the next
+         preview() reflects the localized effect.
+   Finally dt_iop_gui_update(module) refreshes the module's blend UI (consistent
+   with set_params/enable_module).
+
+   Returns {ok=true, formid, mask_id, points=<n>, opacity, feather} or {error}. */
+static int add_path_mask_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+  luaL_checktype(L, 3, LUA_TTABLE);
+  const double opacity_arg = luaL_optnumber(L, 4, 1.0);
+  const double feather_arg = luaL_optnumber(L, 5, 0.005);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+
+  if(!module->blend_params || !module->flags || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    return push_error(L, "module '%s' does not support blending/masks", op);
+
+  const int npoints = (int)lua_rawlen(L, 3);
+  if(npoints < 3)
+    return push_error(L, "path mask needs at least 3 points (got %d)", npoints);
+
+  double opacity = opacity_arg;
+  if(opacity < 0.0) opacity = 0.0;
+  if(opacity > 1.0) opacity = 1.0;
+  double feather = feather_arg;
+  if(feather < 0.0) feather = 0.0;
+  if(feather > 0.5) feather = 0.5;
+  const float border = MAX(0.0005f, (float)feather);
+
+  // Build the polygon form. On ANY malformed node, free the partial form and
+  // report a graceful error (never crash, acceptance #4).
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_PATH);
+  if(!form)
+    return push_error(L, "dt_masks_create failed");
+
+  for(int i = 1; i <= npoints; i++)
+  {
+    lua_rawgeti(L, 3, i); // point table
+    if(lua_type(L, -1) != LUA_TTABLE)
+    {
+      lua_pop(L, 1);
+      dt_masks_free_form(form);
+      return push_error(L, "point %d is not a table {x=..,y=..}", i);
+    }
+    lua_getfield(L, -1, "x");
+    lua_getfield(L, -2, "y");
+    if(!lua_isnumber(L, -2) || !lua_isnumber(L, -1))
+    {
+      lua_pop(L, 3);
+      dt_masks_free_form(form);
+      return push_error(L, "point %d has non-numeric x/y", i);
+    }
+    double x = lua_tonumber(L, -2);
+    double y = lua_tonumber(L, -1);
+    lua_pop(L, 3); // y, x, point table
+
+    if(x < 0.0) x = 0.0;
+    if(x > 1.0) x = 1.0;
+    if(y < 0.0) y = 0.0;
+    if(y > 1.0) y = 1.0;
+
+    dt_masks_point_path_t *bzpt = malloc(sizeof(dt_masks_point_path_t));
+    if(!bzpt)
+    {
+      dt_masks_free_form(form);
+      return push_error(L, "out of memory building path node");
+    }
+    bzpt->corner[0] = (float)x;
+    bzpt->corner[1] = (float)y;
+    // explicit sharp corner: ctrl == corner -> straight edges (see NODE BUILD).
+    bzpt->ctrl1[0] = bzpt->ctrl2[0] = (float)x;
+    bzpt->ctrl1[1] = bzpt->ctrl2[1] = (float)y;
+    bzpt->border[0] = bzpt->border[1] = border;
+    bzpt->state = DT_MASKS_POINT_STATE_USER;
+    form->points = g_list_append(form->points, bzpt);
+  }
+
+  // WIRE: name form, append to dev->forms, create/extend the module's mask
+  // group (sets blend_params->mask_id), add group point, masks-history items.
+  dt_masks_gui_form_save_creation(dev, module, form, NULL);
+
+  const dt_mask_id_t formid = form->formid;
+  const dt_mask_id_t mask_id = module->blend_params->mask_id;
+
+  // (a) override the group point opacity for THIS form to the requested value.
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, mask_id);
+  if(grp)
+  {
+    for(GList *l = grp->points; l; l = g_list_next(l))
+    {
+      dt_masks_point_group_t *gp = (dt_masks_point_group_t *)l->data;
+      if(gp && gp->formid == formid)
+      {
+        gp->opacity = (float)opacity;
+        break;
+      }
+    }
+    // capture the opacity change into masks history.
+    dt_dev_add_masks_history_item(dev, module, TRUE);
+  }
+
+  // (b) turn on the drawn-mask blend mode (both bits, like the GUI toggle).
+  module->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+
+  // (c) commit blend_params + live reprocess (invalidates the pipe so the next
+  // preview() shows the localized effect). module->enabled is passed through --
+  // enabling the module is enable_module's / set_params' job, not ours.
+  dt_dev_add_history_item(dev, module, module->enabled);
+
+  // refresh the module's blend UI (consistent with set_params/enable_module).
+  if(module->expander) dt_iop_gui_update(module);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);                    lua_setfield(L, -2, "ok");
+  lua_pushstring(L, module->op);               lua_setfield(L, -2, "op");
+  lua_pushinteger(L, module->multi_priority);  lua_setfield(L, -2, "instance");
+  lua_pushinteger(L, (lua_Integer)formid);     lua_setfield(L, -2, "formid");
+  lua_pushinteger(L, (lua_Integer)mask_id);    lua_setfield(L, -2, "mask_id");
+  lua_pushinteger(L, npoints);                 lua_setfield(L, -2, "points");
+  lua_pushnumber(L, opacity);                  lua_setfield(L, -2, "opacity");
+  lua_pushnumber(L, border);                   lua_setfield(L, -2, "feather");
+  lua_pushinteger(L, (lua_Integer)module->blend_params->mask_mode);
+  lua_setfield(L, -2, "mask_mode");
+  return 1;
+}
+
 int dt_lua_init_develop(lua_State *L)
 {
   dt_lua_push_darktable_lib(L);
@@ -1854,6 +2046,15 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "add_instance");
+
+  // add_path_mask(op, instance, points, opacity[, feather]): builds a drawn
+  // PATH mask from a polygon and wires it to the module's blend group. Mutates
+  // dev->forms / blend group / blend_params / history -> MUST run on the GUI
+  // thread (see the long note on add_path_mask_cb).
+  lua_pushcfunction(L, add_path_mask_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "add_path_mask");
 
   // history_count(): read-only diagnostic for coalescing observation.
   lua_pushcfunction(L, history_count_cb);
