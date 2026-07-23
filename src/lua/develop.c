@@ -40,7 +40,10 @@
 // wire shapes (see PLAN.md §3.1) change so the bridge can refuse a mismatch.
 // API 2 (T1.7): get_params/set_params decode+encode ARRAY/STRUCT/UNION
 // composites (curves etc.); adds enable_module. API 1 was scalar/bool/enum only.
-#define DT_LUA_DEVELOP_API 2
+// API 3 (T1.4): robust enable_module (forces a distinct history item + flushes
+// the pixelpipe cache via dt_dev_pixelpipe_rebuild to kill the enable/in-flight
+// -render cache-poison no-op race); adds add_instance(op).
+#define DT_LUA_DEVELOP_API 3
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -69,6 +72,21 @@ static int version_cb(lua_State *L)
    `instance` -- and the matching logic in get_params() -- mean multi_priority.
    Keep this consistent for all future methods so a round-trip
    active_modules()->get_params() uses the same key. */
+
+/* Resolve a live module by op + multi_priority (the PUBLIC instance key, see
+   INSTANCE-KEY CONVENTION). Returns NULL if no darkroom image or no match.
+   Shared by every method that targets a single module. */
+static dt_iop_module_t *_find_module(dt_develop_t *dev, const char *op, int instance)
+{
+  if(!dev || !dev->iop) return NULL;
+  for(GList *iter = dev->iop; iter; iter = g_list_next(iter))
+  {
+    dt_iop_module_t *m = (dt_iop_module_t *)iter->data;
+    if(m && !g_strcmp0(m->op, op) && m->multi_priority == instance)
+      return m;
+  }
+  return NULL;
+}
 
 /* darktable.develop.active_modules()
    Walk darktable->develop->iop and return an array of module descriptors for
@@ -1007,16 +1025,69 @@ static int dump_introspection_cb(lua_State *L)
 }
 
 /* darktable.develop.enable_module(op, instance, enabled)
-   ------------------------------------------------------------------
-   Toggle a module on/off and commit that as a history item (the minimal slice
-   of T1.4 needed so a freshly-written curve on a default-DISABLED module like
-   tonecurve actually affects the pipe -- set_params commits with the module's
-   CURRENT enabled flag, so the module must be enabled first). Runs on the GUI
-   thread (gtk_wrap), same threading contract as set_params.
+   ==========================================================================
+   Toggle a module on/off, commit it as a history item, and (re)build the pipe
+   so a subsequent preview() DETERMINISTICALLY reflects the new enabled state.
+   Runs on the GUI thread (gtk_wrap), same threading contract as set_params.
 
-   dt_dev_add_history_item(dev, module, TRUE) sets module->enabled = TRUE
-   itself (develop.c:1246); the disable direction is not handled there, so we
-   set module->enabled explicitly before committing to cover both.
+   MIRRORS THE GUI ENABLE-TOGGLE (develop/imageop.c:1097 _gui_off_callback):
+   the header on/off button sets `module->enabled` itself and then calls
+   dt_dev_add_history_item(dev, module, FALSE) -- it passes FALSE because it has
+   already flipped the flag; the enable arg would only force-enable. We do the
+   same: set module->enabled explicitly (covers BOTH directions -- the enable
+   arg of add_history_item never disables) and then commit.
+
+   We use dt_dev_add_NEW_history_item (not the plain one the GUI uses) on
+   purpose: the GUI relies on a focus_hash change to force a distinct undo entry
+   between toggles, but a headless driver never focuses the widget, so a plain
+   commit would COALESCE the toggle into the top item (same op, identical
+   params -> develop.c "same operation, change params" branch, history_end
+   unchanged). Forcing a new item makes each toggle its own undo step and makes
+   history grow deterministically (acceptance T1.4-S1/S2). new_item also flags
+   the pipes DT_DEV_PIPE_SYNCH (a full param re-commit), not merely TOP_CHANGED.
+
+   THE RACE FIX (the primary objective of T1.4) -----------------------------
+   T1.7 observed that enabling a module while a preview render was already in
+   flight left the module rendering as a NO-OP ~50% of sessions, persistently.
+   ROOT CAUSE (verified in source): the pixelpipe CACHE hash
+   (develop/pixelpipe_cache.c:137) decides whether an upstream piece
+   contributes to a downstream cache key with
+       const gboolean included = piece->module->enabled || piece->enabled;
+   i.e. it reads the LIVE, GUI-thread `module->enabled` LOCK-FREE from the
+   worker thread. Sequence that poisons the cache:
+     1. set_params() on the still-DISABLED module commits its params and kicks a
+        preview render W1. W1 synched piece->enabled = FALSE, so it SKIPS the
+        module (_skip_piece_on_tags, pixelpipe_hb.c:1785) and renders the
+        module OFF.
+     2. enable_module() flips module->enabled = TRUE on the GUI thread WHILE W1
+        is still running.
+     3. As W1 computes the DOWNSTREAM output cache hash it now reads
+        module->enabled == TRUE, so it INCLUDES the module's piece->hash in the
+        key (H_on) -- but the buffer it actually produced has the module OFF.
+        W1 therefore stores an OFF buffer under the ON hash: a poisoned line.
+     4. The next render targets H_on, HITS W1's poisoned line, and serves the
+        OFF buffer -> the enable is a visible no-op. The line survives, so the
+        whole session stays wrong (~50%, depending on whether the flip lands
+        inside W1's hash window).
+   The old enable path (plain dt_dev_add_history_item) only set TOP_CHANGED +
+   invalidated buffers; it never FLUSHED the pipe cache, so the poison was
+   served.
+   FIX: after committing, call dt_dev_pixelpipe_rebuild(dev) -- the same
+   canonical "structure changed" call the GUI multi-instance path uses
+   (imageop.c:786). It sets DT_DEV_PIPE_REMOVE + cache_obsolete=TRUE +
+   dt_dev_invalidate_all (dev->timestamp++) on all pipes. On the next worker
+   pass this (a) takes pipe->busy_mutex, which BLOCKS until any in-flight render
+   has fully finished writing its cache (the recursive process runs under
+   busy_mutex, pixelpipe_hb.c:3083), (b) rebuilds every node so
+   piece->enabled = module->enabled is consistent by construction, and (c)
+   FLUSHES the cache (pixelpipe_hb.c:3173), discarding any poisoned line. After
+   the flip module->enabled stays TRUE, so no future render can reproduce the
+   piece/module disagreement. The timestamp bump means preview()'s freshness
+   gate (status==VALID && input_timestamp>=want_ts, captured AFTER this call)
+   can only be satisfied by a render that started after the rebuild -- it can
+   never accept the pre-enable frame. Deterministic: enable -> preview reflects
+   the module 10/10.
+
    Returns {ok=true, op, instance, enabled=<bool>} or {error="..."}. */
 static int enable_module_cb(lua_State *L)
 {
@@ -1028,27 +1099,86 @@ static int enable_module_cb(lua_State *L)
   if(!dev || !dev->iop)
     return push_error(L, "no darkroom image loaded");
 
-  dt_iop_module_t *module = NULL;
-  for(GList *iter = dev->iop; iter; iter = g_list_next(iter))
-  {
-    dt_iop_module_t *m = (dt_iop_module_t *)iter->data;
-    if(m && !g_strcmp0(m->op, op) && m->multi_priority == instance)
-    {
-      module = m;
-      break;
-    }
-  }
+  dt_iop_module_t *module = _find_module(dev, op, instance);
   if(!module)
     return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
 
+  // 1. flip the live flag (mirrors _gui_off_callback), then commit a distinct
+  //    history entry. Passing `want` also refreshes the GUI on/off button icon
+  //    for the enable direction (add_history_item_ext's `if(enable)` block).
   module->enabled = want;
-  dt_dev_add_history_item(dev, module, want);
+  dt_dev_add_new_history_item(dev, module, want);
+
+  // 2. RACE FIX: rebuild topology + flush the pixelpipe cache (see note above).
+  dt_dev_pixelpipe_rebuild(dev);
 
   lua_newtable(L);
   lua_pushboolean(L, TRUE);            lua_setfield(L, -2, "ok");
   lua_pushstring(L, module->op);       lua_setfield(L, -2, "op");
   lua_pushinteger(L, module->multi_priority); lua_setfield(L, -2, "instance");
   lua_pushboolean(L, module->enabled); lua_setfield(L, -2, "enabled");
+  return 1;
+}
+
+/* darktable.develop.add_instance(op)
+   ==========================================================================
+   Create a new multi-instance of module `op`, mirroring the GUI "new instance"
+   path (develop/imageop.c:703 dt_iop_gui_duplicate, reached from the module
+   header's multi-instance menu). Runs on the GUI thread (gtk_wrap), so calling
+   the GUI helper directly is safe and gives us, in one call: the base module
+   pushed to history, dt_dev_module_duplicate() (develop.c:3720 -- clones params
+   + assigns a fresh unique multi_priority + inserts into dev->iop and the
+   iop-order list), gui_init/expander setup, the new instance committed to
+   history, and dt_dev_pixelpipe_rebuild() to wire the new node into all pipes.
+
+   The new instance therefore immediately shows up in active_modules() (walks
+   dev->iop) and is targetable by op + its multi_priority; set_params on it
+   writes only ITS params blob, independent of instance 0.
+
+   We resolve the base as instance 0 (the base multi_priority), falling back to
+   the lowest-priority instance present. Modules flagged IOP_FLAGS_ONE_INSTANCE
+   forbid duplicates (same gate the GUI uses, imageop.c:971) -> graceful error,
+   never a crash (acceptance T1.4-S4).
+
+   Returns {ok=true, op, instance=<new multi_priority>, base_instance,
+   multi_name} or {error="..."}. */
+static int add_instance_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  // Prefer the base instance (multi_priority 0); else the lowest-priority one.
+  dt_iop_module_t *base = _find_module(dev, op, 0);
+  if(!base)
+  {
+    for(GList *it = dev->iop; it; it = g_list_next(it))
+    {
+      dt_iop_module_t *m = (dt_iop_module_t *)it->data;
+      if(m && !g_strcmp0(m->op, op) && (!base || m->multi_priority < base->multi_priority))
+        base = m;
+    }
+  }
+  if(!base)
+    return push_error(L, "no module '%s' in current darkroom", op);
+
+  if(base->flags() & IOP_FLAGS_ONE_INSTANCE)
+    return push_error(L, "module '%s' does not support multiple instances", op);
+
+  // mirror the GUI new-instance path verbatim (copy_params=TRUE seeds the clone
+  // from the base; set_params later diverges it independently).
+  dt_iop_module_t *inst = dt_iop_gui_duplicate(base, TRUE);
+  if(!inst)
+    return push_error(L, "failed to duplicate module '%s'", op);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);                 lua_setfield(L, -2, "ok");
+  lua_pushstring(L, inst->op);              lua_setfield(L, -2, "op");
+  lua_pushinteger(L, inst->multi_priority); lua_setfield(L, -2, "instance");
+  lua_pushinteger(L, base->multi_priority); lua_setfield(L, -2, "base_instance");
+  lua_pushstring(L, inst->multi_name);      lua_setfield(L, -2, "multi_name");
   return 1;
 }
 
@@ -1494,6 +1624,14 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "enable_module");
+
+  // add_instance(op): duplicates a module via the GUI new-instance path
+  // (dt_iop_gui_duplicate). Writes live develop/GUI state -> MUST run on the
+  // GUI thread.
+  lua_pushcfunction(L, add_instance_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "add_instance");
 
   // history_count(): read-only diagnostic for coalescing observation.
   lua_pushcfunction(L, history_count_cb);
