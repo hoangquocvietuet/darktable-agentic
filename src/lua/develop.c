@@ -2062,6 +2062,89 @@ static int add_path_mask_cb(lua_State *L)
   return 1;
 }
 
+/* darktable.develop.set_raster_source(consumer_op, consumer_instance,
+ *                                      source_op, source_instance[, opacity])
+ * =========================================================================
+ * SPIKE T3.1 (research go/no-go): wire a downstream module's blend to consume
+ * a RASTER mask produced by an upstream source module. This is the ONE piece
+ * the existing bindings could not do (add_path_mask only does DRAWN masks).
+ *
+ * It sets the consumer's blend_params raster fields and commits, exactly like
+ * the GUI raster-mask picker: mask_mode |= ENABLED|RASTER, raster_mask_source =
+ * <source op>, raster_mask_instance = <source multi_priority>, raster_mask_id =
+ * BLEND_RASTER_ID. dt_dev_add_history_item -> dt_iop_commit_blend_params then
+ * registers the consumer into source->raster_mask.source.users (imageop.c:1951),
+ * which is what makes dt_iop_is_raster_mask_used() true so the source actually
+ * emits its mask (e.g. iop/rasterfile.c:560).
+ *
+ * The source module must be EARLIER in the pixelpipe (lower iop_order) than the
+ * consumer, else dt_dev_get_raster_mask() refuses it (pixelpipe_hb.c:3539).
+ * Runs on the GUI thread (gtk_wrap), same contract as add_path_mask.
+ *
+ * Returns {ok, consumer, source, raster_mask_source, raster_mask_instance,
+ * mask_mode, opacity} or {error}. */
+static int set_raster_source_cb(lua_State *L)
+{
+  const char *cop = luaL_checkstring(L, 1);
+  const int cinst = luaL_optinteger(L, 2, 0);
+  const char *sop = luaL_checkstring(L, 3);
+  const int sinst = luaL_optinteger(L, 4, 0);
+  const double opacity_arg = luaL_optnumber(L, 5, 100.0);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *consumer = _find_module(dev, cop, cinst);
+  if(!consumer)
+    return push_error(L, "no consumer module '%s' instance %d", cop, cinst);
+  dt_iop_module_t *source = _find_module(dev, sop, sinst);
+  if(!source)
+    return push_error(L, "no source module '%s' instance %d", sop, sinst);
+
+  if(!consumer->blend_params || !consumer->flags
+     || !(consumer->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    return push_error(L, "consumer '%s' does not support blending", cop);
+
+  if(source->iop_order >= consumer->iop_order)
+    return push_error(L,
+        "source '%s' (iop_order %g) must be EARLIER than consumer '%s' (iop_order %g)",
+        sop, source->iop_order, cop, consumer->iop_order);
+
+  double opacity = opacity_arg;
+  if(opacity < 0.0) opacity = 0.0;
+  if(opacity > 100.0) opacity = 100.0;
+
+  // wire the raster sink, exactly like the GUI raster picker.
+  consumer->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+  g_strlcpy(consumer->blend_params->raster_mask_source, source->op,
+            sizeof(consumer->blend_params->raster_mask_source));
+  consumer->blend_params->raster_mask_instance = source->multi_priority;
+  consumer->blend_params->raster_mask_id = BLEND_RASTER_ID;
+  consumer->blend_params->raster_mask_invert = FALSE;
+  consumer->blend_params->opacity = (float)opacity;
+
+  // commit blend_params + live reprocess (dt_iop_commit_blend_params runs
+  // inside, registering the raster-mask user link).
+  dt_dev_add_history_item(dev, consumer, consumer->enabled);
+  if(consumer->expander) dt_iop_gui_update(consumer);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);                       lua_setfield(L, -2, "ok");
+  lua_pushstring(L, consumer->op);                lua_setfield(L, -2, "consumer");
+  lua_pushinteger(L, consumer->multi_priority);   lua_setfield(L, -2, "consumer_instance");
+  lua_pushstring(L, source->op);                  lua_setfield(L, -2, "source");
+  lua_pushinteger(L, source->multi_priority);     lua_setfield(L, -2, "source_instance");
+  lua_pushstring(L, consumer->blend_params->raster_mask_source);
+  lua_setfield(L, -2, "raster_mask_source");
+  lua_pushinteger(L, consumer->blend_params->raster_mask_instance);
+  lua_setfield(L, -2, "raster_mask_instance");
+  lua_pushinteger(L, (lua_Integer)consumer->blend_params->mask_mode);
+  lua_setfield(L, -2, "mask_mode");
+  lua_pushnumber(L, opacity);                     lua_setfield(L, -2, "opacity");
+  return 1;
+}
+
 int dt_lua_init_develop(lua_State *L)
 {
   dt_lua_push_darktable_lib(L);
@@ -2123,6 +2206,14 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "add_path_mask");
+
+  // set_raster_source(consumer_op, consumer_instance, source_op, source_instance
+  // [, opacity]): SPIKE T3.1 -- wire a downstream module's blend to consume an
+  // upstream module's RASTER mask. Mutates blend_params + history -> GUI thread.
+  lua_pushcfunction(L, set_raster_source_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "set_raster_source");
 
   // history_count(): read-only diagnostic for coalescing observation.
   lua_pushcfunction(L, history_count_cb);
