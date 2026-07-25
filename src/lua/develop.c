@@ -25,12 +25,14 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/pixelpipe_hb.h"
+#include "iop/retouch.h"
 #include "lua/call.h"
 #include "lua/configuration.h"
 #include "lua/lua.h"
 #include "lua/types.h"
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <limits.h>
 #include <math.h>
 #include <float.h>
 #include <png.h>
@@ -59,7 +61,17 @@
 // the full image in TOP-LEFT normalized 0..1 coords, CLAMPED to [0,1]. It is a
 // drop-in for get_preview()'s `region` arg; the raw center-relative zoom_x/
 // zoom_y (which can be negative) are NOT. Purely additive: all API-5 fields kept.
-#define DT_LUA_DEVELOP_API 6
+// API 7 (bugfix batch): (1) adds current_image() -> {has_image,id,path,filename}
+// so a caller (mask_raster) can resolve the file for the image the user opened
+// BY HAND in the GUI, without having had to open it via open_darkroom itself.
+// (2) add_path_mask() now defaults to SMOOTH boundaries: it computes Catmull-Rom
+// bezier control points per node (new optional `smooth` arg, default true) so
+// rounded subjects no longer get a faceted outline; and `feather` is now
+// interpreted as a FRACTION of the mask's own bounding box (default 0.02), not a
+// frame-constant, so a small/thin subject no longer "glows"/bleeds. Purely
+// additive at the wire level; the feather semantic change is documented on the
+// tool. All API-6 fields kept.
+#define DT_LUA_DEVELOP_API 7
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -1940,7 +1952,11 @@ static int add_path_mask_cb(lua_State *L)
   const int instance = luaL_optinteger(L, 2, 0);
   luaL_checktype(L, 3, LUA_TTABLE);
   const double opacity_arg = luaL_optnumber(L, 4, 1.0);
-  const double feather_arg = luaL_optnumber(L, 5, 0.005);
+  // feather is now a FRACTION of the mask bbox (see API 7 note), default 2%.
+  const double feather_arg = luaL_optnumber(L, 5, 0.02);
+  // smooth boundary via Catmull-Rom bezier handles; default on. Pass false for
+  // the legacy faceted (straight-segment) polygon.
+  const int smooth = lua_isnoneornil(L, 6) ? 1 : lua_toboolean(L, 6);
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -1963,30 +1979,31 @@ static int add_path_mask_cb(lua_State *L)
   double feather = feather_arg;
   if(feather < 0.0) feather = 0.0;
   if(feather > 0.5) feather = 0.5;
-  const float border = MAX(0.0005f, (float)feather);
 
-  // Build the polygon form. On ANY malformed node, free the partial form and
-  // report a graceful error (never crash, acceptance #4).
-  dt_masks_form_t *form = dt_masks_create(DT_MASKS_PATH);
-  if(!form)
-    return push_error(L, "dt_masks_create failed");
-
-  for(int i = 1; i <= npoints; i++)
+  // First pass: read + clamp every node into a plain C array, and track the
+  // polygon's bounding box. We need all corners up front to (a) derive smooth
+  // Catmull-Rom bezier handles from each node's neighbors and (b) scale the
+  // feather to the mask's OWN size instead of a frame constant. On ANY
+  // malformed node, free and report a graceful error (never crash, #4).
+  float *cx = g_malloc_n(npoints, sizeof(float));
+  float *cy = g_malloc_n(npoints, sizeof(float));
+  float minx = 1.0f, miny = 1.0f, maxx = 0.0f, maxy = 0.0f;
+  for(int i = 0; i < npoints; i++)
   {
-    lua_rawgeti(L, 3, i); // point table
+    lua_rawgeti(L, 3, i + 1); // point table (1-based)
     if(lua_type(L, -1) != LUA_TTABLE)
     {
       lua_pop(L, 1);
-      dt_masks_free_form(form);
-      return push_error(L, "point %d is not a table {x=..,y=..}", i);
+      g_free(cx); g_free(cy);
+      return push_error(L, "point %d is not a table {x=..,y=..}", i + 1);
     }
     lua_getfield(L, -1, "x");
     lua_getfield(L, -2, "y");
     if(!lua_isnumber(L, -2) || !lua_isnumber(L, -1))
     {
       lua_pop(L, 3);
-      dt_masks_free_form(form);
-      return push_error(L, "point %d has non-numeric x/y", i);
+      g_free(cx); g_free(cy);
+      return push_error(L, "point %d has non-numeric x/y", i + 1);
     }
     double x = lua_tonumber(L, -2);
     double y = lua_tonumber(L, -1);
@@ -1996,22 +2013,66 @@ static int add_path_mask_cb(lua_State *L)
     if(x > 1.0) x = 1.0;
     if(y < 0.0) y = 0.0;
     if(y > 1.0) y = 1.0;
+    cx[i] = (float)x;
+    cy[i] = (float)y;
+    if(cx[i] < minx) minx = cx[i];
+    if(cx[i] > maxx) maxx = cx[i];
+    if(cy[i] < miny) miny = cy[i];
+    if(cy[i] > maxy) maxy = cy[i];
+  }
 
+  // feather (soft edge) as a fraction of the mask's bbox max dimension, so a
+  // small subject gets a proportionally small edge instead of a frame-constant
+  // halo. Floored so a degenerate/near-zero bbox still yields a valid border.
+  const float bbox_dim = MAX(maxx - minx, maxy - miny);
+  const float border = MAX(0.0005f, (float)feather * MAX(bbox_dim, 1e-4f));
+
+  // Build the polygon form.
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_PATH);
+  if(!form)
+  {
+    g_free(cx); g_free(cy);
+    return push_error(L, "dt_masks_create failed");
+  }
+
+  for(int i = 0; i < npoints; i++)
+  {
     dt_masks_point_path_t *bzpt = malloc(sizeof(dt_masks_point_path_t));
     if(!bzpt)
     {
       dt_masks_free_form(form);
+      g_free(cx); g_free(cy);
       return push_error(L, "out of memory building path node");
     }
-    bzpt->corner[0] = (float)x;
-    bzpt->corner[1] = (float)y;
-    // explicit sharp corner: ctrl == corner -> straight edges (see NODE BUILD).
-    bzpt->ctrl1[0] = bzpt->ctrl2[0] = (float)x;
-    bzpt->ctrl1[1] = bzpt->ctrl2[1] = (float)y;
+    bzpt->corner[0] = cx[i];
+    bzpt->corner[1] = cy[i];
+    if(smooth && npoints >= 3)
+    {
+      // Catmull-Rom -> cubic bezier control points, closed loop (indices wrap).
+      // Matches darktable's own _path_catmull_to_bezier (masks/path.c): incoming
+      // handle ctrl1 = (C[i-1] + 6*C[i] - C[i+1])/6, outgoing handle
+      // ctrl2 = (-C[i-1] + 6*C[i] + C[i+1])/6. Explicit handles + USER state keep
+      // the smooth shape stable through the blend/eval path (which does NOT
+      // resolve the -1 auto-sentinel), so no more faceted outline on curves.
+      const int pv = (i - 1 + npoints) % npoints;
+      const int nx = (i + 1) % npoints;
+      bzpt->ctrl1[0] = (cx[pv] + 6.0f * cx[i] - cx[nx]) / 6.0f;
+      bzpt->ctrl1[1] = (cy[pv] + 6.0f * cy[i] - cy[nx]) / 6.0f;
+      bzpt->ctrl2[0] = (-cx[pv] + 6.0f * cx[i] + cx[nx]) / 6.0f;
+      bzpt->ctrl2[1] = (-cy[pv] + 6.0f * cy[i] + cy[nx]) / 6.0f;
+    }
+    else
+    {
+      // sharp corner: ctrl == corner -> straight edges (legacy faceted shape).
+      bzpt->ctrl1[0] = bzpt->ctrl2[0] = cx[i];
+      bzpt->ctrl1[1] = bzpt->ctrl2[1] = cy[i];
+    }
     bzpt->border[0] = bzpt->border[1] = border;
     bzpt->state = DT_MASKS_POINT_STATE_USER;
     form->points = g_list_append(form->points, bzpt);
   }
+  g_free(cx);
+  g_free(cy);
 
   // WIRE: name form, append to dev->forms, create/extend the module's mask
   // group (sets blend_params->mask_id), add group point, masks-history items.
@@ -2057,8 +2118,373 @@ static int add_path_mask_cb(lua_State *L)
   lua_pushinteger(L, npoints);                 lua_setfield(L, -2, "points");
   lua_pushnumber(L, opacity);                  lua_setfield(L, -2, "opacity");
   lua_pushnumber(L, border);                   lua_setfield(L, -2, "feather");
+  lua_pushboolean(L, smooth);                  lua_setfield(L, -2, "smooth");
   lua_pushinteger(L, (lua_Integer)module->blend_params->mask_mode);
   lua_setfield(L, -2, "mask_mode");
+  return 1;
+}
+
+/* ---- Retouch module: local heal/clone/blur/fill shapes ------------------
+   Distinct from add_path_mask's generic "restrict this module's blended
+   output to a region": each retouch shape ties a mask FORM to a PER-SHAPE
+   entry in the retouch module's OWN dt_iop_retouch_params_t.rt_forms[]
+   array (iop/retouch.h, extracted from iop/retouch.c so this file can see
+   the layout) carrying that shape's algorithm + wavelet scale; heal/clone
+   additionally store an absolute normalized source point directly on the
+   form (dt_masks_form_t.source[0,1], develop/masks.h) -- confirmed NOT a
+   delta by develop/masks/circle.c's own source-point code.
+
+   retouch.c's rt_resynch_params (which normally keeps rt_forms[] in sync
+   with the mask group) is `static`, unreachable from here, and only ever
+   runs from gui_update() -- itself only called if module->expander is set.
+   Pixel processing (rt_compute_roi_in, iop/retouch.c) reads rt_forms[]
+   directly by formid, not through rt_resynch_params, so every binding below
+   writes/removes its own rt_forms[] entry directly instead of depending on
+   a GUI refresh -- correct whether or not the retouch panel happens to be
+   expanded when MCP acts. Also: unlike add_path_mask, these do NOT touch
+   blend_params->mask_mode -- retouch's own processing keys off
+   blend_params->mask_id directly; the mask_mode restrict-blend bits are an
+   unrelated generic-blend feature and setting them here would be wrong. */
+
+static gboolean rt_algo_from_string(const char *s, dt_iop_retouch_algo_type_t *out)
+{
+  if(!s) return FALSE;
+  if(!g_strcmp0(s, "heal")) { *out = DT_IOP_RETOUCH_HEAL; return TRUE; }
+  if(!g_strcmp0(s, "clone")) { *out = DT_IOP_RETOUCH_CLONE; return TRUE; }
+  return FALSE;
+}
+
+static const char *rt_algo_to_string(dt_iop_retouch_algo_type_t a)
+{
+  switch(a)
+  {
+    case DT_IOP_RETOUCH_CLONE: return "clone";
+    case DT_IOP_RETOUCH_HEAL:  return "heal";
+    case DT_IOP_RETOUCH_BLUR:  return "blur";
+    case DT_IOP_RETOUCH_FILL:  return "fill";
+    default: return "none";
+  }
+}
+
+/* darktable.develop.retouch_add_shape(op, instance, algorithm, target_x,
+ * target_y, radius, feather, source_x, source_y[, scale][, opacity])
+ * ===========================================================================
+ * Create a CIRCLE retouch shape (heal or clone; only shape/algorithms
+ * supported in this build -- see the module doc comment above) and bind it
+ * to a wavelet scale. Runs on the GUI thread (dt_lua_gtk_wrap).
+ *
+ * ARGS
+ *   op, instance   must resolve to the "retouch" module -- this binding
+ *                  assumes the retouch params layout, unlike add_path_mask.
+ *   algorithm      "heal" or "clone".
+ *   target_x/y     shape center, normalized [0,1] image coords, clamped.
+ *   radius/feather normalized, clamped to [0.0005, 0.5] / [0, 0.5].
+ *   source_x/y     required (heal/clone always need a source point).
+ *   scale          optional wavelet scale, 0..RETOUCH_MAX_SCALES+1 (residual
+ *                  slot); default = the module's current curr_scale.
+ *   opacity        optional 0..1, default 1.0.
+ *
+ * Returns {ok=true, op, instance, formid, mask_id, algorithm, shape_type,
+ * target={x,y}, source={x,y}, radius, feather, opacity, wavelet_scale} or
+ * {error=...}. */
+static int retouch_add_shape_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+  const char *algo_str = luaL_checkstring(L, 3);
+  const double target_x_arg = luaL_checknumber(L, 4);
+  const double target_y_arg = luaL_checknumber(L, 5);
+  const double radius_arg = luaL_checknumber(L, 6);
+  const double feather_arg = luaL_checknumber(L, 7);
+  if(lua_isnoneornil(L, 8) || lua_isnoneornil(L, 9))
+    return push_error(L, "retouch_add_shape: source_x/source_y required for heal/clone");
+  const double source_x_arg = luaL_checknumber(L, 8);
+  const double source_y_arg = luaL_checknumber(L, 9);
+  const int scale_arg = luaL_optinteger(L, 10, -1); // -1 => default to curr_scale
+  const double opacity_arg = luaL_optnumber(L, 11, 1.0);
+
+  dt_iop_retouch_algo_type_t algorithm;
+  if(!rt_algo_from_string(algo_str, &algorithm))
+    return push_error(L, "retouch_add_shape: unsupported algorithm '%s' "
+                          "(only 'heal'/'clone' in this build)", algo_str);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+  if(g_strcmp0(module->op, "retouch"))
+    return push_error(L, "retouch_add_shape: module '%s' is not the retouch module", op);
+
+  dt_iop_retouch_params_t *p = (dt_iop_retouch_params_t *)module->params;
+
+  // find a free rt_forms[] slot (mirrors retouch.c's static rt_allow_create_form cap check).
+  int slot = -1;
+  for(int i = 0; i < RETOUCH_NO_FORMS; i++)
+  {
+    if(!dt_is_valid_maskid(p->rt_forms[i].formid)) { slot = i; break; }
+  }
+  if(slot < 0)
+    return push_error(L, "retouch_add_shape: %d shape limit reached for this instance", RETOUCH_NO_FORMS);
+
+  const double target_x = CLAMPS(target_x_arg, 0.0, 1.0);
+  const double target_y = CLAMPS(target_y_arg, 0.0, 1.0);
+  const double source_x = CLAMPS(source_x_arg, 0.0, 1.0);
+  const double source_y = CLAMPS(source_y_arg, 0.0, 1.0);
+  const double radius = CLAMPS(radius_arg, 0.0005, 0.5);
+  const double feather = CLAMPS(feather_arg, 0.0, 0.5);
+  const double opacity = CLAMPS(opacity_arg, 0.0, 1.0);
+  const int scale = (scale_arg < 0) ? p->curr_scale : (int)CLAMPS(scale_arg, 0, RETOUCH_MAX_SCALES + 1);
+
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | DT_MASKS_CLONE);
+  if(!form)
+    return push_error(L, "dt_masks_create failed");
+
+  dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
+  if(!circle)
+  {
+    dt_masks_free_form(form);
+    return push_error(L, "out of memory building circle shape");
+  }
+  circle->center[0] = (float)target_x;
+  circle->center[1] = (float)target_y;
+  circle->radius = (float)radius;
+  circle->border = (float)feather;
+  form->points = g_list_append(form->points, circle);
+
+  form->source[0] = (float)source_x;
+  form->source[1] = (float)source_y;
+  form->source[2] = 0.0f;
+
+  // WIRE: name form, append to dev->forms, create/extend the module's mask
+  // group (sets blend_params->mask_id), add group point, masks-history item.
+  dt_masks_gui_form_save_creation(dev, module, form, NULL);
+
+  const dt_mask_id_t formid = form->formid;
+  const dt_mask_id_t mask_id = module->blend_params->mask_id;
+
+  // override the group point's opacity to the requested value (save_creation
+  // seeds it from a conf default) -- same pattern as add_path_mask_cb.
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, mask_id);
+  if(grp)
+  {
+    for(GList *l = grp->points; l; l = g_list_next(l))
+    {
+      dt_masks_point_group_t *gp = (dt_masks_point_group_t *)l->data;
+      if(gp && gp->formid == formid)
+      {
+        gp->opacity = (float)opacity;
+        break;
+      }
+    }
+    dt_dev_add_masks_history_item(dev, module, TRUE);
+  }
+
+  // write the rt_forms[] entry DIRECTLY -- see the module doc comment above
+  // for why this must not depend on rt_resynch_params.
+  memset(&p->rt_forms[slot], 0, sizeof(dt_iop_retouch_form_data_t));
+  p->rt_forms[slot].formid = formid;
+  p->rt_forms[slot].scale = scale;
+  p->rt_forms[slot].algorithm = algorithm;
+  p->rt_forms[slot].distort_mode = 2;
+
+  // commit params + live reprocess (invalidates the pipe so the next
+  // preview() reflects the new shape).
+  dt_dev_add_history_item(dev, module, module->enabled);
+
+  if(module->expander) dt_iop_gui_update(module);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);                        lua_setfield(L, -2, "ok");
+  lua_pushstring(L, module->op);                   lua_setfield(L, -2, "op");
+  lua_pushinteger(L, module->multi_priority);      lua_setfield(L, -2, "instance");
+  lua_pushinteger(L, (lua_Integer)formid);         lua_setfield(L, -2, "formid");
+  lua_pushinteger(L, (lua_Integer)mask_id);        lua_setfield(L, -2, "mask_id");
+  lua_pushstring(L, rt_algo_to_string(algorithm)); lua_setfield(L, -2, "algorithm");
+  lua_pushstring(L, "circle");                     lua_setfield(L, -2, "shape_type");
+  lua_newtable(L);
+  lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
+  lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
+  lua_setfield(L, -2, "target");
+  lua_newtable(L);
+  lua_pushnumber(L, source_x); lua_setfield(L, -2, "x");
+  lua_pushnumber(L, source_y); lua_setfield(L, -2, "y");
+  lua_setfield(L, -2, "source");
+  lua_pushnumber(L, radius);   lua_setfield(L, -2, "radius");
+  lua_pushnumber(L, feather);  lua_setfield(L, -2, "feather");
+  lua_pushnumber(L, opacity);  lua_setfield(L, -2, "opacity");
+  lua_pushinteger(L, scale);   lua_setfield(L, -2, "wavelet_scale");
+  return 1;
+}
+
+/* darktable.develop.retouch_delete_shape(op, instance, formid)
+ * ===========================================================================
+ * Remove a retouch shape (mask form + its rt_forms[] entry). Runs on the GUI
+ * thread. Manually compacts rt_forms[] instead of relying on
+ * rt_resynch_params (see the module doc comment above), so deletion is
+ * correct headless.
+ *
+ * Returns {ok=true} or {error=...}. */
+static int retouch_delete_shape_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+  const dt_mask_id_t formid = (dt_mask_id_t)luaL_checkinteger(L, 3);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+  if(g_strcmp0(module->op, "retouch"))
+    return push_error(L, "retouch_delete_shape: module '%s' is not the retouch module", op);
+
+  dt_iop_retouch_params_t *p = (dt_iop_retouch_params_t *)module->params;
+
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  if(!grp)
+    return push_error(L, "retouch_delete_shape: module has no shapes group");
+
+  gboolean is_member = FALSE;
+  for(GList *l = grp->points; l; l = g_list_next(l))
+  {
+    dt_masks_point_group_t *gp = (dt_masks_point_group_t *)l->data;
+    if(gp && gp->formid == formid) { is_member = TRUE; break; }
+  }
+  if(!is_member)
+    return push_error(L, "retouch_delete_shape: formid %d is not a shape on module '%s'",
+                       (int)formid, op);
+
+  dt_masks_form_t *form = dt_masks_get_from_id(dev, formid);
+  if(!form)
+    return push_error(L, "retouch_delete_shape: formid %d not found", (int)formid);
+
+  dt_masks_form_remove(module, grp, form);
+
+  // manually compact rt_forms[] -- see the module doc comment above.
+  int found = -1;
+  for(int i = 0; i < RETOUCH_NO_FORMS; i++)
+  {
+    if(p->rt_forms[i].formid == formid) { found = i; break; }
+  }
+  if(found >= 0)
+  {
+    for(int i = found; i < RETOUCH_NO_FORMS - 1; i++)
+      p->rt_forms[i] = p->rt_forms[i + 1];
+    memset(&p->rt_forms[RETOUCH_NO_FORMS - 1], 0, sizeof(dt_iop_retouch_form_data_t));
+  }
+
+  dt_dev_add_history_item(dev, module, module->enabled);
+  if(module->expander) dt_iop_gui_update(module);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE); lua_setfield(L, -2, "ok");
+  return 1;
+}
+
+/* darktable.develop.retouch_list_shapes(op, instance)
+ * ===========================================================================
+ * Read-only: the real, currently-attached retouch shapes for a module
+ * instance (cross-referencing the mask group's points with rt_forms[] by
+ * formid) -- NOT the raw 300-slot rt_forms array the generic get_params
+ * introspection would otherwise expose full of mostly-NO_MASKID padding.
+ * Also returns the module's wavelet-scale state.
+ *
+ * Returns {module="retouch", instance, num_scales, curr_scale,
+ * merge_from_scale, shapes={{formid, algorithm, shape_type, target={x,y},
+ * source={x,y} (heal/clone only), radius, feather, wavelet_scale}, ...}} or
+ * {error=...}. */
+static int retouch_list_shapes_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+  if(g_strcmp0(module->op, "retouch"))
+    return push_error(L, "retouch_list_shapes: module '%s' is not the retouch module", op);
+
+  const dt_iop_retouch_params_t *p = (const dt_iop_retouch_params_t *)module->params;
+
+  lua_newtable(L);
+  lua_pushstring(L, "retouch");                lua_setfield(L, -2, "module");
+  lua_pushinteger(L, module->multi_priority);  lua_setfield(L, -2, "instance");
+  lua_pushinteger(L, p->num_scales);           lua_setfield(L, -2, "num_scales");
+  lua_pushinteger(L, p->curr_scale);           lua_setfield(L, -2, "curr_scale");
+  lua_pushinteger(L, p->merge_from_scale);     lua_setfield(L, -2, "merge_from_scale");
+
+  lua_newtable(L);
+  int out_index = 1;
+
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  if(grp && (grp->type & DT_MASKS_GROUP))
+  {
+    for(GList *l = grp->points; l; l = g_list_next(l))
+    {
+      dt_masks_point_group_t *gp = (dt_masks_point_group_t *)l->data;
+      if(!gp) continue;
+      const dt_mask_id_t formid = gp->formid;
+
+      int rt_index = -1;
+      for(int i = 0; i < RETOUCH_NO_FORMS; i++)
+      {
+        if(p->rt_forms[i].formid == formid) { rt_index = i; break; }
+      }
+      if(rt_index < 0) continue; // not a retouch shape entry; skip defensively
+
+      dt_masks_form_t *form = dt_masks_get_from_id(dev, formid);
+      if(!form) continue;
+
+      lua_newtable(L);
+      lua_pushinteger(L, (lua_Integer)formid); lua_setfield(L, -2, "formid");
+      lua_pushstring(L, rt_algo_to_string(p->rt_forms[rt_index].algorithm));
+      lua_setfield(L, -2, "algorithm");
+      lua_pushinteger(L, p->rt_forms[rt_index].scale); lua_setfield(L, -2, "wavelet_scale");
+
+      if(form->type & DT_MASKS_CIRCLE)
+      {
+        lua_pushstring(L, "circle"); lua_setfield(L, -2, "shape_type");
+        dt_masks_point_circle_t *circle =
+          form->points ? (dt_masks_point_circle_t *)form->points->data : NULL;
+        if(circle)
+        {
+          lua_newtable(L);
+          lua_pushnumber(L, circle->center[0]); lua_setfield(L, -2, "x");
+          lua_pushnumber(L, circle->center[1]); lua_setfield(L, -2, "y");
+          lua_setfield(L, -2, "target");
+          lua_pushnumber(L, circle->radius); lua_setfield(L, -2, "radius");
+          lua_pushnumber(L, circle->border); lua_setfield(L, -2, "feather");
+        }
+      }
+      else
+      {
+        // pre-existing GUI-created ellipse/path/brush shape -- not creatable
+        // via MCP yet (Phase 2), but don't crash reading it back.
+        lua_pushstring(L, "unknown"); lua_setfield(L, -2, "shape_type");
+      }
+
+      if(form->type & (DT_MASKS_CLONE | DT_MASKS_NON_CLONE))
+      {
+        lua_newtable(L);
+        lua_pushnumber(L, form->source[0]); lua_setfield(L, -2, "x");
+        lua_pushnumber(L, form->source[1]); lua_setfield(L, -2, "y");
+        lua_setfield(L, -2, "source");
+      }
+
+      lua_rawseti(L, -2, out_index++);
+    }
+  }
+
+  lua_setfield(L, -2, "shapes");
   return 1;
 }
 
@@ -2145,6 +2571,183 @@ static int set_raster_source_cb(lua_State *L)
   return 1;
 }
 
+/* darktable.develop.current_image()
+   Read-only: report the image currently open in darkroom -- its imgid and
+   absolute on-disk path -- so a caller can resolve the source file WITHOUT
+   having had to open it via open_darkroom (the common case: the user opened a
+   photo BY HAND in the GUI, so the MCP side never cached the path). Returns
+   {has_image, id, path, filename}; has_image=false (id=-1) when no darkroom
+   image is loaded. Mirrors the old DBus get_current_image. Reads live develop
+   state -> registered wrapped in dt_lua_gtk_wrap. */
+static int current_image_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  lua_newtable(L);
+
+  const dt_imgid_t imgid = dev ? dev->image_storage.id : NO_IMGID;
+  if(!dev || !dt_is_valid_imgid(imgid))
+  {
+    lua_pushboolean(L, FALSE); lua_setfield(L, -2, "has_image");
+    lua_pushinteger(L, -1);    lua_setfield(L, -2, "id");
+    return 1;
+  }
+
+  char pathname[PATH_MAX] = { 0 };
+  gboolean from_cache = FALSE;
+  dt_image_full_path(imgid, pathname, sizeof(pathname), &from_cache);
+
+  lua_pushboolean(L, TRUE);                        lua_setfield(L, -2, "has_image");
+  lua_pushinteger(L, (lua_Integer)imgid);          lua_setfield(L, -2, "id");
+  lua_pushstring(L, pathname);                     lua_setfield(L, -2, "path");
+  lua_pushstring(L, dev->image_storage.filename);  lua_setfield(L, -2, "filename");
+  return 1;
+}
+
+/* Human-readable mask type name for a dt_masks_type_t bitmask. */
+static const char *_mask_type_name(dt_masks_type_t t)
+{
+  if(t & DT_MASKS_CIRCLE)   return "circle";
+  if(t & DT_MASKS_PATH)     return "path";
+  if(t & DT_MASKS_GROUP)    return "group";
+  if(t & DT_MASKS_GRADIENT) return "gradient";
+  if(t & DT_MASKS_ELLIPSE)  return "ellipse";
+  if(t & DT_MASKS_BRUSH)    return "brush";
+  return "unknown";
+}
+
+/* Push {x=.., y=..} from a float[2] under `key` of the table at top of stack. */
+static void _push_xy(lua_State *L, const char *key, const float xy[2])
+{
+  lua_newtable(L);
+  lua_pushnumber(L, xy[0]); lua_setfield(L, -2, "x");
+  lua_pushnumber(L, xy[1]); lua_setfield(L, -2, "y");
+  lua_setfield(L, -2, key);
+}
+
+/* darktable.develop.list_masks(op, instance)
+   Read-only: enumerate the drawn masks wired into a module instance's blend
+   group, so a caller knows EXACTLY which mask_id it is about to edit (and does
+   not clobber a stale instance). Returns [] when the module has no drawn masks.
+   Each entry: {mask_id, type, opacity, nb_points, name, module, instance}.
+   Reads live dev->forms -> registered wrapped in dt_lua_gtk_wrap. */
+static int list_masks_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = (int)luaL_optinteger(L, 2, 0);
+  if(!dev) return push_error(L, "no darkroom image loaded");
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module) return push_error(L, "module '%s' instance %d not found", op, instance);
+  if(!module->blend_params) return push_error(L, "module '%s' has no blend params", op);
+
+  lua_newtable(L);
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return 1;  // empty: no drawn masks
+
+  int idx = 1;
+  for(GList *it = grp->points; it; it = g_list_next(it))
+  {
+    dt_masks_point_group_t *pg = (dt_masks_point_group_t *)it->data;
+    if(!pg) continue;
+    dt_masks_form_t *f = dt_masks_get_from_id(dev, pg->formid);
+    if(!f) continue;
+    lua_newtable(L);
+    lua_pushinteger(L, pg->formid);                            lua_setfield(L, -2, "mask_id");
+    lua_pushstring(L, _mask_type_name(f->type));               lua_setfield(L, -2, "type");
+    lua_pushnumber(L, pg->opacity);                            lua_setfield(L, -2, "opacity");
+    lua_pushinteger(L, (lua_Integer)g_list_length(f->points)); lua_setfield(L, -2, "nb_points");
+    lua_pushstring(L, f->name);                                lua_setfield(L, -2, "name");
+    lua_pushstring(L, op);                                     lua_setfield(L, -2, "module");
+    lua_pushinteger(L, instance);                              lua_setfield(L, -2, "instance");
+    lua_rawseti(L, -2, idx++);
+  }
+  return 1;
+}
+
+/* darktable.develop.get_mask(mask_id)
+   Read-only: dump one mask form's geometry so a caller can edit individual
+   points instead of recreating the whole mask. Returns {mask_id, type, name,
+   points=[...]} where each node carries its control handles + per-node border
+   (feather). Path/brush -> node list; circle/ellipse/gradient -> single-entry
+   shape descriptor. Reads live dev->forms -> registered wrapped in
+   dt_lua_gtk_wrap. */
+static int get_mask_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  const dt_mask_id_t id = (dt_mask_id_t)luaL_checkinteger(L, 1);
+  if(!dev) return push_error(L, "no darkroom image loaded");
+  dt_masks_form_t *f = dt_masks_get_from_id(dev, id);
+  if(!f) return push_error(L, "mask %d not found in darkroom forms", id);
+
+  lua_newtable(L);
+  lua_pushinteger(L, f->formid);                lua_setfield(L, -2, "mask_id");
+  lua_pushstring(L, _mask_type_name(f->type));  lua_setfield(L, -2, "type");
+  lua_pushstring(L, f->name);                   lua_setfield(L, -2, "name");
+
+  lua_newtable(L);  // points[]
+  int idx = 1;
+  if(f->type & DT_MASKS_PATH)
+  {
+    for(GList *it = f->points; it; it = g_list_next(it))
+    {
+      dt_masks_point_path_t *p = (dt_masks_point_path_t *)it->data;
+      if(!p) continue;
+      lua_newtable(L);
+      _push_xy(L, "corner", p->corner);
+      _push_xy(L, "ctrl1", p->ctrl1);
+      _push_xy(L, "ctrl2", p->ctrl2);
+      _push_xy(L, "border", p->border);
+      lua_pushinteger(L, p->state); lua_setfield(L, -2, "state");
+      lua_rawseti(L, -2, idx++);
+    }
+  }
+  else if(f->type & DT_MASKS_BRUSH)
+  {
+    for(GList *it = f->points; it; it = g_list_next(it))
+    {
+      dt_masks_point_brush_t *p = (dt_masks_point_brush_t *)it->data;
+      if(!p) continue;
+      lua_newtable(L);
+      _push_xy(L, "corner", p->corner);
+      _push_xy(L, "ctrl1", p->ctrl1);
+      _push_xy(L, "ctrl2", p->ctrl2);
+      _push_xy(L, "border", p->border);
+      lua_pushnumber(L, p->density);  lua_setfield(L, -2, "density");
+      lua_pushnumber(L, p->hardness); lua_setfield(L, -2, "hardness");
+      lua_pushinteger(L, p->state);   lua_setfield(L, -2, "state");
+      lua_rawseti(L, -2, idx++);
+    }
+  }
+  else if(f->type & DT_MASKS_CIRCLE)
+  {
+    dt_masks_point_circle_t *c = f->points ? (dt_masks_point_circle_t *)f->points->data : NULL;
+    if(c)
+    {
+      lua_newtable(L);
+      _push_xy(L, "center", c->center);
+      lua_pushnumber(L, c->radius); lua_setfield(L, -2, "radius");
+      lua_pushnumber(L, c->border); lua_setfield(L, -2, "border");
+      lua_rawseti(L, -2, idx++);
+    }
+  }
+  else if(f->type & DT_MASKS_ELLIPSE)
+  {
+    dt_masks_point_ellipse_t *e = f->points ? (dt_masks_point_ellipse_t *)f->points->data : NULL;
+    if(e)
+    {
+      lua_newtable(L);
+      _push_xy(L, "center", e->center);
+      lua_pushnumber(L, e->radius[0]); lua_setfield(L, -2, "radius_a");
+      lua_pushnumber(L, e->radius[1]); lua_setfield(L, -2, "radius_b");
+      lua_pushnumber(L, e->rotation);  lua_setfield(L, -2, "rotation");
+      lua_pushnumber(L, e->border);    lua_setfield(L, -2, "border");
+      lua_rawseti(L, -2, idx++);
+    }
+  }
+  lua_setfield(L, -2, "points");
+  return 1;
+}
+
 int dt_lua_init_develop(lua_State *L)
 {
   dt_lua_push_darktable_lib(L);
@@ -2162,6 +2765,13 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "active_modules");
+
+  // current_image(): read-only report of the darkroom image (id + full path) ->
+  // GUI thread. Lets mask_raster resolve the file for a hand-opened image.
+  lua_pushcfunction(L, current_image_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "current_image");
 
   // get_params(op, instance): reads live params/introspection -> GUI thread.
   lua_pushcfunction(L, get_params_cb);
@@ -2207,6 +2817,25 @@ int dt_lua_init_develop(lua_State *L)
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "add_path_mask");
 
+  // retouch_add_shape/delete_shape/list_shapes: local heal/clone retouch
+  // shapes tied to the retouch module's own rt_forms[] + wavelet scale.
+  // Mutate dev->forms / module params / history -> MUST run on the GUI
+  // thread (see the long note at the top of retouch_add_shape_cb).
+  lua_pushcfunction(L, retouch_add_shape_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "retouch_add_shape");
+
+  lua_pushcfunction(L, retouch_delete_shape_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "retouch_delete_shape");
+
+  lua_pushcfunction(L, retouch_list_shapes_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "retouch_list_shapes");
+
   // set_raster_source(consumer_op, consumer_instance, source_op, source_instance
   // [, opacity]): SPIKE T3.1 -- wire a downstream module's blend to consume an
   // upstream module's RASTER mask. Mutates blend_params + history -> GUI thread.
@@ -2227,6 +2856,22 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "get_viewport");
+
+  // list_masks(op, instance): read-only enumeration of a module's drawn masks
+  // (mask_id/type/opacity/nb_points) so a caller edits the right mask. Reads
+  // live dev->forms -> GUI thread.
+  lua_pushcfunction(L, list_masks_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "list_masks");
+
+  // get_mask(mask_id): read-only dump of one form's points + control handles +
+  // per-node border (feather) so points can be edited in place. Reads live
+  // dev->forms -> GUI thread.
+  lua_pushcfunction(L, get_mask_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "get_mask");
 
   // preview(max_w, max_h): grabs the live preview_pipe backbuf and encodes a
   // PNG, with NO DB write. Registered DELIBERATELY WITHOUT dt_lua_gtk_wrap:
