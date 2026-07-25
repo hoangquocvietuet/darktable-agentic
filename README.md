@@ -17,16 +17,24 @@ darkroom editing state from outside the GUI.
 - Default branch: `agentic-mcp`
 - Diff against upstream: 6 files, ~3000 lines added (see [What this fork changes](#what-this-fork-changes))
 
+## The point of this, in one paragraph
+
+This is not automation. Nothing here produces a finished edit while the photographer looks away. The
+whole point is a **copilot, not an autopilot**: the photographer stays the editor, an AI collaborator
+proposes one small reversible step at a time — a parameter nudge, a mask, a healed spot — and shows
+the result in the photographer's own darkroom preview so they can react to it. That only works if the
+darkroom session it operates on is the real, interactive one the photographer is sitting in front of,
+not a batch job somewhere else. This repo is the C-level plumbing that makes a live step possible at
+all; the actual collaboration happens one layer up, in
+[rfordinal/darktable-mcp](https://github.com/rfordinal/darktable-mcp) — read that repo for the full
+picture of what using this feels like.
+
 ## Why this fork exists
 
-The goal is live conversational raw editing: a photographer says "brighten the sky a bit" or
-"heal that dust spot", an LLM adjusts the actual darktable pixelpipe, and the photographer sees
-the result in the darkroom preview immediately.
-
-darktable's stock Lua API cannot do that. It exposes images, films, tags, styles, storages and
-GUI actions, but not the live `dt_develop_t` state: no module params, no history, no masks, no
-way to read back what the pipe just produced. The available workarounds are all dead ends for an
-agent:
+darktable's stock Lua API cannot support that kind of live, step-by-step collaboration. It exposes
+images, films, tags, styles, storages and GUI actions, but not the live `dt_develop_t` state: no
+module params, no history, no masks, no way to read back what the pipe just produced. The available
+workarounds are all dead ends for an agent:
 
 - `darktable-cli` never loads the user's library and cannot touch a live darkroom.
 - `dt.gui.action` drives GUI widgets, which means single-image, focus-dependent, GUI-only, and it
