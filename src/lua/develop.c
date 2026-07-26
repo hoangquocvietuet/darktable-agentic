@@ -1520,6 +1520,119 @@ static int backtransform_point_cb(lua_State *L)
   return 1;
 }
 
+/* Convert one mask/pipe-input-frame normalized point into a processed/display-
+ * frame normalized point -- the exact INVERSE direction of
+ * backtransform_point_cb above. Shared by transform_point_cb and
+ * retouch_list_shapes_cb (the latter reports BOTH frames so a caller reading
+ * shapes back never has to guess which frame the numbers are in; that guess
+ * was itself a bug source -- see the 2026-07-26 overlay-render work).
+ * Caller supplies the dims already fetched via dt_masks_get_image_size(). */
+static gboolean _mask_point_to_display(dt_develop_t *dev,
+                                       const float wd, const float ht,
+                                       const float iwidth, const float iheight,
+                                       const double mx, const double my,
+                                       double *dx, double *dy)
+{
+  float pt[2] = { (float)mx * iwidth, (float)my * iheight };
+  if(!dt_dev_distort_transform(dev, pt, 1)) return FALSE;
+  *dx = pt[0] / wd;
+  *dy = pt[1] / ht;
+  return TRUE;
+}
+
+/* Same direction for a LENGTH (radius/feather) rather than a position. Input
+ * is in dt_masks' own radius convention (normalized against
+ * mindim(iwidth, iheight) -- circle.c:1139-1144); output is normalized against
+ * the display frame's WIDTH, which is the convention the viewport/overlay
+ * Python side uses for radii (never height, never the w/h mean). Measured by
+ * transforming a second point offset along x, i.e. locally correct for affine
+ * transforms and first-order under lens-correction/perspective -- same
+ * accuracy caveat as backtransform_point's len1/len2. */
+static gboolean _mask_len_to_display(dt_develop_t *dev,
+                                     const float wd, const float ht,
+                                     const float iwidth, const float iheight,
+                                     const double mx, const double my,
+                                     const double mlen, double *dlen)
+{
+  const float mindim = fminf(iwidth, iheight);
+  float pts[4] = { (float)mx * iwidth,                          (float)my * iheight,
+                   (float)mx * iwidth + (float)mlen * mindim,   (float)my * iheight };
+  if(!dt_dev_distort_transform(dev, pts, 2)) return FALSE;
+  const float ddx = pts[2] - pts[0];
+  const float ddy = pts[3] - pts[1];
+  *dlen = sqrtf(ddx * ddx + ddy * ddy) / wd;
+  (void)ht;
+  return TRUE;
+}
+
+/* darktable.develop.transform_point(x, y[, len1][, len2])
+ * ===========================================================================
+ * The INVERSE of backtransform_point: a point normalized 0..1 against the
+ * PIPE-INPUT/mask frame (the frame dt_masks -- and therefore
+ * retouch_list_shapes/get_mask -- stores geometry in) converted into a point
+ * normalized 0..1 against the CURRENT PROCESSED/display frame (the frame
+ * get_viewport()/get_preview()/capture_viewport render in).
+ *
+ * WHY THIS EXISTS: backtransform_point closed the WRITE path (viewport
+ * coordinates -> mask geometry). The READ path was still broken: an agent that
+ * wrote a shape via retouch_add_shape_in_viewport and then read it back with
+ * retouch_list_shapes got mask-frame numbers while looking at a display-frame
+ * render, so the two never matched whenever orientation/crop/rotate/
+ * lens-correction was active (portrait shots: ALWAYS). Verifying "did my shape
+ * land where I aimed?" or drawing an overlay on top of a captured render both
+ * need this direction.
+ *
+ * len1/len2 (optional): lengths (e.g. a circle radius/feather) in dt_masks'
+ * mindim-normalized convention, returned normalized against the display
+ * frame's WIDTH. See _mask_len_to_display.
+ *
+ * Returns {x, y[, len1][, len2]} or {error=...}. Runs on the GUI thread. */
+static int transform_point_cb(lua_State *L)
+{
+  const double x_arg = luaL_checknumber(L, 1);
+  const double y_arg = luaL_checknumber(L, 2);
+  const gboolean has_len1 = !lua_isnoneornil(L, 3);
+  const double len1_arg = luaL_optnumber(L, 3, 0.0);
+  const gboolean has_len2 = !lua_isnoneornil(L, 4);
+  const double len2_arg = luaL_optnumber(L, 4, 0.0);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  float wd, ht, iwidth, iheight;
+  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+  if(wd <= 0.0f || ht <= 0.0f || iwidth <= 0.0f || iheight <= 0.0f)
+    return push_error(L, "transform_point: no processed pipe yet");
+
+  const double x = CLAMPS(x_arg, 0.0, 1.0);
+  const double y = CLAMPS(y_arg, 0.0, 1.0);
+
+  double dx = 0.0, dy = 0.0;
+  if(!_mask_point_to_display(dev, wd, ht, iwidth, iheight, x, y, &dx, &dy))
+    return push_error(L, "transform_point: distort_transform failed");
+
+  lua_newtable(L);
+  lua_pushnumber(L, dx); lua_setfield(L, -2, "x");
+  lua_pushnumber(L, dy); lua_setfield(L, -2, "y");
+
+  if(has_len1)
+  {
+    double dlen = 0.0;
+    if(!_mask_len_to_display(dev, wd, ht, iwidth, iheight, x, y, len1_arg, &dlen))
+      return push_error(L, "transform_point: distort_transform failed (len1)");
+    lua_pushnumber(L, dlen); lua_setfield(L, -2, "len1");
+  }
+  if(has_len2)
+  {
+    double dlen = 0.0;
+    if(!_mask_len_to_display(dev, wd, ht, iwidth, iheight, x, y, len2_arg, &dlen))
+      return push_error(L, "transform_point: distort_transform failed (len2)");
+    lua_pushnumber(L, dlen); lua_setfield(L, -2, "len2");
+  }
+  return 1;
+}
+
 /* ==========================================================================
    darktable.develop.preview(max_w, max_h)
    --------------------------------------------------------------------------
@@ -2643,10 +2756,28 @@ static int retouch_delete_shape_cb(lua_State *L)
  * introspection would otherwise expose full of mostly-NO_MASKID padding.
  * Also returns the module's wavelet-scale state.
  *
+ * COORDINATE FRAMES: target/source/radius/feather are dt_masks' OWN storage
+ * values, i.e. normalized against the PIPE-INPUT/mask frame (radius/feather
+ * against mindim(iwidth,iheight)). Those are the values retouch_add_shape/
+ * retouch_update_shape take back, so a read-modify-write round trip is exact.
+ * They are NOT the frame get_viewport()/get_preview()/capture_viewport render
+ * in -- so each shape ALSO carries target_display/source_display/
+ * radius_display/feather_display (see _mask_point_to_display /
+ * _mask_len_to_display), which are directly plottable on top of a captured
+ * render. Reporting only the mask frame made "is my shape where I aimed it?"
+ * unanswerable for any portrait/cropped image; reporting both removes the
+ * guess. The *_display fields are omitted (not zeroed) when no processed pipe
+ * exists yet or distort_transform fails.
+ *
+ * opacity is the mask GROUP MEMBER's opacity (dt_masks_point_group_t.opacity,
+ * what retouch_add_shape/update_shape's `opacity` arg writes), not the
+ * module's blend opacity.
+ *
  * Returns {module="retouch", instance, num_scales, curr_scale,
  * merge_from_scale, shapes={{formid, algorithm, shape_type, target={x,y},
- * source={x,y} (heal/clone only), radius, feather, wavelet_scale}, ...}} or
- * {error=...}. */
+ * source={x,y} (heal/clone only), radius, feather, opacity, wavelet_scale,
+ * target_display={x,y}, source_display={x,y}, radius_display,
+ * feather_display}, ...}} or {error=...}. */
 static int retouch_list_shapes_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -2670,6 +2801,15 @@ static int retouch_list_shapes_cb(lua_State *L)
   lua_pushinteger(L, p->num_scales);           lua_setfield(L, -2, "num_scales");
   lua_pushinteger(L, p->curr_scale);           lua_setfield(L, -2, "curr_scale");
   lua_pushinteger(L, p->merge_from_scale);     lua_setfield(L, -2, "merge_from_scale");
+
+  // dims for the mask -> display frame conversion (COORDINATE FRAMES note
+  // above). All zero while no processed pipe exists yet, in which case every
+  // *_display field is simply omitted rather than reported as a bogus 0.
+  float wd = 0.0f, ht = 0.0f, iwidth = 0.0f, iheight = 0.0f;
+  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+  const gboolean have_display =
+    (wd > 0.0f && ht > 0.0f && iwidth > 0.0f && iheight > 0.0f);
+  lua_pushboolean(L, have_display); lua_setfield(L, -2, "has_display_frame");
 
   lua_newtable(L);
   int out_index = 1;
@@ -2698,6 +2838,7 @@ static int retouch_list_shapes_cb(lua_State *L)
       lua_pushstring(L, rt_algo_to_string(p->rt_forms[rt_index].algorithm));
       lua_setfield(L, -2, "algorithm");
       lua_pushinteger(L, p->rt_forms[rt_index].scale); lua_setfield(L, -2, "wavelet_scale");
+      lua_pushnumber(L, gp->opacity); lua_setfield(L, -2, "opacity");
 
       if(form->type & DT_MASKS_CIRCLE)
       {
@@ -2712,6 +2853,30 @@ static int retouch_list_shapes_cb(lua_State *L)
           lua_setfield(L, -2, "target");
           lua_pushnumber(L, circle->radius); lua_setfield(L, -2, "radius");
           lua_pushnumber(L, circle->border); lua_setfield(L, -2, "feather");
+
+          double dx = 0.0, dy = 0.0, dlen = 0.0;
+          if(have_display
+             && _mask_point_to_display(dev, wd, ht, iwidth, iheight,
+                                       circle->center[0], circle->center[1], &dx, &dy))
+          {
+            lua_newtable(L);
+            lua_pushnumber(L, dx); lua_setfield(L, -2, "x");
+            lua_pushnumber(L, dy); lua_setfield(L, -2, "y");
+            lua_setfield(L, -2, "target_display");
+
+            if(_mask_len_to_display(dev, wd, ht, iwidth, iheight,
+                                    circle->center[0], circle->center[1],
+                                    circle->radius, &dlen))
+            {
+              lua_pushnumber(L, dlen); lua_setfield(L, -2, "radius_display");
+            }
+            if(_mask_len_to_display(dev, wd, ht, iwidth, iheight,
+                                    circle->center[0], circle->center[1],
+                                    circle->border, &dlen))
+            {
+              lua_pushnumber(L, dlen); lua_setfield(L, -2, "feather_display");
+            }
+          }
         }
       }
       else
@@ -2727,6 +2892,17 @@ static int retouch_list_shapes_cb(lua_State *L)
         lua_pushnumber(L, form->source[0]); lua_setfield(L, -2, "x");
         lua_pushnumber(L, form->source[1]); lua_setfield(L, -2, "y");
         lua_setfield(L, -2, "source");
+
+        double sx = 0.0, sy = 0.0;
+        if(have_display
+           && _mask_point_to_display(dev, wd, ht, iwidth, iheight,
+                                     form->source[0], form->source[1], &sx, &sy))
+        {
+          lua_newtable(L);
+          lua_pushnumber(L, sx); lua_setfield(L, -2, "x");
+          lua_pushnumber(L, sy); lua_setfield(L, -2, "y");
+          lua_setfield(L, -2, "source_display");
+        }
       }
 
       lua_rawseti(L, -2, out_index++);
@@ -3121,6 +3297,17 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "backtransform_point");
+
+  // transform_point(x, y[, len1][, len2]): the INVERSE direction -- pipe-input/
+  // mask-frame normalized point -> processed/display-frame normalized point.
+  // Needed to VERIFY or DRAW an existing mask shape against what
+  // get_preview()/capture_viewport actually renders (retouch_list_shapes
+  // reports mask-frame storage values; those two frames differ for every
+  // portrait/cropped image). Reads live pipe state -> GUI thread.
+  lua_pushcfunction(L, transform_point_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "transform_point");
 
   // list_masks(op, instance): read-only enumeration of a module's drawn masks
   // (mask_id/type/opacity/nb_points) so a caller edits the right mask. Reads
