@@ -1704,6 +1704,16 @@ void dt_masks_iop_use_same_as(dt_iop_module_t *module,
   dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 }
 
+dt_masks_form_t *dt_masks_group_ensure_for_module(dt_develop_t *dev,
+                                                  dt_iop_module_t *module)
+{
+  if(!module) return NULL;
+  dt_masks_form_t *grp = _group_from_module(dev, module);
+  if(!grp)
+    grp = _group_create(dev, module, DT_MASKS_GROUP);
+  return grp;
+}
+
 void dt_masks_iop_combo_populate(GtkWidget *w, dt_iop_module_t **m)
 {
   // we ensure that the module has focus

@@ -661,6 +661,13 @@ void dt_masks_group_ungroup(dt_masks_form_t *dest_grp, dt_masks_form_t *grp);
 void dt_masks_group_update_name(dt_iop_module_t *module);
 dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
                                                 const dt_masks_form_t *form);
+/* find module's existing blend group (blend_params->mask_id), or create a
+   fresh DT_MASKS_GROUP for it if none exists yet -- exactly the get-or-create
+   step the GUI's "add existing shape"/"use same as" menu actions do inline
+   (masks.c's _menu_add_exist / dt_masks_iop_use_same_as), factored out here so
+   headless callers (Lua attach_mask) can reuse it too. */
+dt_masks_form_t *dt_masks_group_ensure_for_module(dt_develop_t *dev,
+                                                  struct dt_iop_module_t *module);
 
 void dt_masks_iop_edit_toggle_callback(GtkToggleButton *togglebutton,
                                        struct dt_iop_module_t *module);
