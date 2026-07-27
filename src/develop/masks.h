@@ -1331,6 +1331,13 @@ const struct dt_masks_point_raster_t *dt_masks_group_find_raster_of(GList *forms
                                                                     const gboolean any_id);
 dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
                                                 const dt_masks_form_t *form);
+/* find module's existing blend group (blend_params->mask_id), or create a
+   fresh DT_MASKS_GROUP for it if none exists yet -- exactly the get-or-create
+   step the GUI's "add existing shape"/"use same as" menu actions do inline
+   (masks.c's _menu_add_exist / dt_masks_iop_use_same_as), factored out here so
+   headless callers (Lua attach_mask) can reuse it too. */
+dt_masks_form_t *dt_masks_group_ensure_for_module(dt_develop_t *dev,
+                                                  struct dt_iop_module_t *module);
 
 dt_masks_edit_mode_t dt_masks_get_edit_mode(void);
 void dt_masks_set_edit_mode(struct dt_iop_module_t *module,

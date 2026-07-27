@@ -90,6 +90,23 @@ static int version_cb(lua_State *L)
   return 1;
 }
 
+/* darktable.develop.get_conf_string(key) -- read-only passthrough to
+   dt_conf_get_string() for an arbitrary core conf key (e.g.
+   "plugins/darkroom/lut3d/def_path", the lut3d module's configured LUT root
+   directory). dt_conf_get_string() is backed by its own mutex
+   (darktable.conf->mutex, control/conf.c:_conf_get_var) so this needs no
+   GUI-thread marshaling, same as version_cb above. Unknown keys resolve to
+   the confgen default (possibly empty string), never an error -- matches
+   dt_conf_get_string()'s own behavior. */
+static int get_conf_string_cb(lua_State *L)
+{
+  const char *key = luaL_checkstring(L, 1);
+  gchar *value = dt_conf_get_string(key);
+  lua_pushstring(L, value ? value : "");
+  g_free(value);
+  return 1;
+}
+
 /* INSTANCE-KEY CONVENTION (used by every method in this namespace)
    ------------------------------------------------------------------
    The PUBLIC api key `instance` == module->multi_priority (imageop.h:290):
@@ -1175,7 +1192,7 @@ static int enable_module_cb(lua_State *L)
   return 1;
 }
 
-/* darktable.develop.add_instance(op)
+/* darktable.develop.add_instance(op[, fields])
    ==========================================================================
    Create a new multi-instance of module `op`, mirroring the GUI "new instance"
    path (develop/imageop.c:703 dt_iop_gui_duplicate, reached from the module
@@ -1195,11 +1212,40 @@ static int enable_module_cb(lua_State *L)
    forbid duplicates (same gate the GUI uses, imageop.c:971) -> graceful error,
    never a crash (acceptance T1.4-S4).
 
+   fields (optional table): initial param overrides applied to the NEW
+   instance right after duplication, via set_params_cb's own introspection
+   write path (lua_call'd directly below -- same field semantics/clamping/
+   unknown-field reporting as a standalone set_params call). This exists
+   because dt_iop_gui_duplicate's copy_params=TRUE (imageop.c:757-759) does a
+   flat memcpy of the BASE instance's params over whatever reload_defaults()
+   just computed for the new instance -- for exposure specifically, that means
+   a second instance inherits compensate_exposure_bias/compensate_hilite_pres
+   from instance 0 even though reload_defaults would have given the new
+   instance its own (usually FALSE) values (see exposure.c's reload_defaults,
+   compensate_hilite_pres = dt_iop_is_first_instance(...)). A caller building a
+   local dodge/burn instance wants exposure=0/compensate_*=false from the very
+   first history entry, not as a lagging second edit.
+
+   This does NOT create a second history entry: dev->focus_hash is already
+   TRUE in any live darkroom session (dt_iop_request_focus only flips it
+   FALSE->TRUE once, on the very first module focus after a history reload --
+   see _dev_add_history_item_ext's dedup condition, develop/develop.c:
+   1258-1268), so by the time this fields-write runs, module == hist->module
+   (same instance dt_iop_gui_duplicate just committed) and focus_hash is
+   unchanged from that commit -> the dedup condition holds and this second
+   dt_dev_add_history_item (inside set_params_cb) REUSES the just-created
+   history item (memcpy over it, develop.c:1305-1306) instead of appending a
+   new one. Same mechanism already relied on for consecutive same-module
+   set_params calls (documented in CLAUDE.md's LUT tooling section).
+
    Returns {ok=true, op, instance=<new multi_priority>, base_instance,
-   multi_name} or {error="..."}. */
+   multi_name, fields_applied=<set_params result, if fields given>} or
+   {error="..."}. */
 static int add_instance_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
+  const gboolean has_fields = !lua_isnoneornil(L, 2);
+  if(has_fields) luaL_checktype(L, 2, LUA_TTABLE);
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -1234,6 +1280,23 @@ static int add_instance_cb(lua_State *L)
   lua_pushinteger(L, inst->multi_priority); lua_setfield(L, -2, "instance");
   lua_pushinteger(L, base->multi_priority); lua_setfield(L, -2, "base_instance");
   lua_pushstring(L, inst->multi_name);      lua_setfield(L, -2, "multi_name");
+
+  if(has_fields)
+  {
+    // Re-invoke set_params_cb as a REAL Lua call (lua_call, not a direct C
+    // call) so its own luaL_check/lua_next arg indices resolve against a
+    // fresh call frame (op/instance/fields), exactly as if a caller had made
+    // a separate set_params(op, instance, fields) call right after
+    // add_instance -- see the long note above for why this collapses into
+    // the SAME history entry rather than adding a second one.
+    lua_pushcfunction(L, set_params_cb);
+    lua_pushstring(L, inst->op);
+    lua_pushinteger(L, inst->multi_priority);
+    lua_pushvalue(L, 2); // the fields table (arg 2 of add_instance)
+    lua_call(L, 3, 1);   // -> {ok, applied, clamped, unknown_fields} or {error=...}
+    lua_setfield(L, -2, "fields_applied");
+  }
+
   return 1;
 }
 
@@ -2996,6 +3059,156 @@ static int set_raster_source_cb(lua_State *L)
   return 1;
 }
 
+/* darktable.develop.get_blend_params(op, instance)
+   ------------------------------------------------------------------
+   LUT tooling (2026-07-26): lut3d has no "amount" of its own -- the ONLY way
+   to run a LUT at partial strength (the reported 15-50% portrait use case)
+   is the module's blend opacity. blend_params is a SEPARATE flat struct
+   (dt_develop_blend_params_t, develop/blend.h) from the introspected
+   per-module params get_params()/set_params() already expose, so those two
+   generic bindings never touch it -- hence this dedicated pair.
+
+   opacity here is 0..100 (blend.h's own native scale, see blend.c:321 et al
+   CLIP(bp->opacity / 100.0f)), matching the EXISTING set_raster_source_cb
+   convention above, not mask_object/retouch's 0..1 -- do not conflate the
+   two; the Python layer converts at its boundary (same pattern already
+   documented for mask_raster's opacity, see CLAUDE.md).
+
+   Returns {op, instance, opacity, mask_mode, blend_mode} or {error=...} if
+   no darkroom image, no such module/instance, or the module does not
+   support blending at all (module->flags() lacks IOP_FLAGS_SUPPORTS_BLENDING
+   -- a handful of modules, e.g. rawdenoise's precursor stages, opt out).
+   Read-only, but reads live develop state -> GUI thread (gtk_wrap). */
+static int get_blend_params_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+  if(!module->blend_params || !module->flags || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    return push_error(L, "module '%s' does not support blending", op);
+
+  lua_newtable(L);
+  lua_pushstring(L, module->op);                    lua_setfield(L, -2, "op");
+  lua_pushinteger(L, module->multi_priority);       lua_setfield(L, -2, "instance");
+  lua_pushnumber(L, module->blend_params->opacity); lua_setfield(L, -2, "opacity");
+  lua_pushinteger(L, (lua_Integer)module->blend_params->mask_mode);
+  lua_setfield(L, -2, "mask_mode");
+  lua_pushinteger(L, (lua_Integer)module->blend_params->blend_mode);
+  lua_setfield(L, -2, "blend_mode");
+  lua_pushboolean(L, (module->blend_params->mask_combine & DEVELOP_COMBINE_MASKS_POS) ? TRUE : FALSE);
+  lua_setfield(L, -2, "invert");
+  return 1;
+}
+
+/* darktable.develop.set_blend_params(op, instance, {opacity?, blend_mode?,
+   enable_uniform_blend?, invert?})
+   ------------------------------------------------------------------
+   Write blend_params fields directly (plain struct, no introspection --
+   see get_blend_params_cb above for why this is a separate pair from
+   get_params/set_params) and commit via dt_dev_add_history_item, exactly
+   the write+commit shape set_raster_source_cb above already uses for this
+   same struct.
+
+   enable_uniform_blend, if given, OVERWRITES mask_mode wholesale: true ->
+   DEVELOP_MASK_ENABLED (blend.h's own "uniformly" mode -- the whole module
+   output blended toward the base image at `opacity`, no mask), false ->
+   DEVELOP_MASK_DISABLED (module runs at its native 100%, opacity ignored).
+   This is deliberately all-or-nothing: a caller wanting a MASKED blend
+   (drawn/parametric/raster) already has retouch_add_shape, mask_object,
+   mask_raster and set_raster_source for that, each of which sets mask_mode's other bits
+   itself -- mixing this convenience in would risk silently clobbering a
+   mask_id/raster wiring those tools set up. opacity alone, with mask_mode
+   left untouched, is a no-op on a module whose blend was never enabled
+   (mask_mode defaults to DEVELOP_MASK_DISABLED = 0) -- pass
+   enable_uniform_blend=true alongside it the first time.
+
+   invert toggles DEVELOP_COMBINE_MASKS_POS in blend_params->mask_combine --
+   the exact bit the GUI's mask "polarity" toggle flips (_blendop_masks_
+   polarity_callback, develop/blend_gui.c:1735), i.e. inverts the WHOLE drawn/
+   parametric/raster mask for this module. Per-shape polarity is a SEPARATE
+   bit (DT_MASKS_STATE_INVERSE on the individual dt_masks_point_group_t,
+   reported read-only by list_masks' `invert` field) that this binding does
+   not write -- attach_mask does not expose it either (not asked for; add it
+   there if a caller ever needs per-shape rather than whole-group polarity).
+
+   Returns {ok=true, op, instance, opacity, mask_mode, blend_mode, invert} (the
+   POST-write values) or {error=...}. opacity is clamped to [0,100], never
+   rejected -- no clamp report table, unlike set_params, since blend_params
+   has no introspection Min/Max to report against. */
+static int set_blend_params_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = luaL_optinteger(L, 2, 0);
+  luaL_checktype(L, 3, LUA_TTABLE);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+  if(!module->blend_params || !module->flags || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    return push_error(L, "module '%s' does not support blending", op);
+
+  lua_getfield(L, 3, "enable_uniform_blend");
+  if(!lua_isnil(L, -1))
+  {
+    module->blend_params->mask_mode = lua_toboolean(L, -1) ? DEVELOP_MASK_ENABLED : DEVELOP_MASK_DISABLED;
+  }
+  lua_pop(L, 1);
+
+  lua_getfield(L, 3, "opacity");
+  if(!lua_isnil(L, -1))
+  {
+    double opacity = lua_tonumber(L, -1);
+    if(opacity < 0.0) opacity = 0.0;
+    if(opacity > 100.0) opacity = 100.0;
+    module->blend_params->opacity = (float)opacity;
+  }
+  lua_pop(L, 1);
+
+  lua_getfield(L, 3, "blend_mode");
+  if(!lua_isnil(L, -1))
+  {
+    module->blend_params->blend_mode = (uint32_t)lua_tointeger(L, -1);
+  }
+  lua_pop(L, 1);
+
+  lua_getfield(L, 3, "invert");
+  if(!lua_isnil(L, -1))
+  {
+    if(lua_toboolean(L, -1))
+      module->blend_params->mask_combine |= DEVELOP_COMBINE_MASKS_POS;
+    else
+      module->blend_params->mask_combine &= ~DEVELOP_COMBINE_MASKS_POS;
+  }
+  lua_pop(L, 1);
+
+  dt_dev_add_history_item(dev, module, module->enabled);
+  if(module->expander) dt_iop_gui_update(module);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);                         lua_setfield(L, -2, "ok");
+  lua_pushstring(L, module->op);                     lua_setfield(L, -2, "op");
+  lua_pushinteger(L, module->multi_priority);        lua_setfield(L, -2, "instance");
+  lua_pushnumber(L, module->blend_params->opacity);  lua_setfield(L, -2, "opacity");
+  lua_pushinteger(L, (lua_Integer)module->blend_params->mask_mode);
+  lua_setfield(L, -2, "mask_mode");
+  lua_pushinteger(L, (lua_Integer)module->blend_params->blend_mode);
+  lua_setfield(L, -2, "blend_mode");
+  lua_pushboolean(L, (module->blend_params->mask_combine & DEVELOP_COMBINE_MASKS_POS) ? TRUE : FALSE);
+  lua_setfield(L, -2, "invert");
+  return 1;
+}
+
 /* darktable.develop.current_image()
    Read-only: report the image currently open in darkroom -- its imgid and
    absolute on-disk path -- so a caller can resolve the source file WITHOUT
@@ -3040,6 +3253,229 @@ static const char *_mask_type_name(dt_masks_type_t t)
   return "unknown";
 }
 
+/* darktable.develop.list_all_masks()
+   Read-only: enumerate EVERY drawn mask shape in the current image
+   (dev->forms), regardless of which module currently uses it -- so a caller
+   can find a shape drawn by hand in the GUI (or by another module's tool
+   earlier in the session) and wire it into a brand new module instance via
+   attach_mask(), without guessing or duplicating it. Skips DT_MASKS_GROUP
+   forms themselves: those are the per-module blend-group CONTAINERS
+   (module->blend_params->mask_id -> one dt_masks_form_t of type
+   DT_MASKS_GROUP per module, see dt_masks_group_ensure_for_module), internal
+   plumbing rather than a user-facing shape.
+
+   Each entry: {formid, name, type, used_by=[{op, instance}, ...]}. used_by is
+   resolved by walking dev->iop and checking every module's blend group for a
+   point referencing this formid -- a shape can legally be referenced by more
+   than one module's group at once (that is the whole point of attach_mask not
+   copying the shape, dt_masks_group_add_form, masks.c:2084).
+
+   Reads live dev->forms + dev->iop -> registered wrapped in dt_lua_gtk_wrap. */
+static int list_all_masks_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  if(!dev) return push_error(L, "no darkroom image loaded");
+
+  lua_newtable(L);
+  int idx = 1;
+  for(GList *forms = dev->forms; forms; forms = g_list_next(forms))
+  {
+    dt_masks_form_t *f = (dt_masks_form_t *)forms->data;
+    if(!f || (f->type & DT_MASKS_GROUP)) continue; // skip per-module group containers
+
+    lua_newtable(L);
+    lua_pushinteger(L, f->formid);               lua_setfield(L, -2, "formid");
+    lua_pushstring(L, f->name);                   lua_setfield(L, -2, "name");
+    lua_pushstring(L, _mask_type_name(f->type));  lua_setfield(L, -2, "type");
+
+    lua_newtable(L); // used_by[]
+    int uidx = 1;
+    for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
+    {
+      dt_iop_module_t *m = (dt_iop_module_t *)iops->data;
+      if(!m || !m->blend_params) continue;
+      dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+      if(!grp || !(grp->type & DT_MASKS_GROUP)) continue;
+
+      gboolean found = FALSE;
+      for(GList *pts = grp->points; pts; pts = g_list_next(pts))
+      {
+        dt_masks_point_group_t *pg = (dt_masks_point_group_t *)pts->data;
+        if(pg && pg->formid == f->formid) { found = TRUE; break; }
+      }
+      if(found)
+      {
+        lua_newtable(L);
+        lua_pushstring(L, m->op);               lua_setfield(L, -2, "op");
+        lua_pushinteger(L, m->multi_priority);   lua_setfield(L, -2, "instance");
+        lua_rawseti(L, -2, uidx++);
+      }
+    }
+    lua_setfield(L, -2, "used_by");
+
+    lua_rawseti(L, -2, idx++);
+  }
+  return 1;
+}
+
+/* darktable.develop.attach_mask(op, instance, formid[, operation])
+   Wire an EXISTING drawn mask shape (formid, from list_all_masks() or the
+   return value of add_path_mask/mask_object/retouch_add_shape) into module
+   (op, instance)'s blend group WITHOUT copying it -- the shape stays a single
+   dev->forms entry, now referenced by this module's group IN ADDITION to
+   whatever already referenced it. Reuses dt_masks_group_add_form (masks.c:
+   2084), the exact function the GUI's "add existing shape" menu item calls
+   (_menu_add_exist, masks.c:1638). Creates the module's blend group on first
+   use (dt_masks_group_ensure_for_module) exactly like the GUI would.
+
+   operation selects how this shape combines with the OTHER shapes already in
+   the group (masks.h DT_MASKS_STATE_* bits): "union" (default),
+   "intersection", "difference", "exclusion". Meaningless-but-harmless for the
+   first shape added to an empty group (nothing to combine against yet).
+
+   Wiring the group reference alone does NOT make the mask actually apply
+   during pixel processing (bugreport 2026-07-27): dt_dev_pixelpipe's
+   _piece_wants_blending (pixelpipe_hb.c:1383) gates the blend call on
+   blend_params->mask_mode & DEVELOP_MASK_ENABLED, and blend.c's own
+   mode_drawn check (blend.c:469) needs DEVELOP_MASK_MASK -- neither bit is
+   implied by dt_masks_group_add_form. The GUI's own "enable drawn mask"
+   pencil toggle (_blendop_masks_modes_toggle, blend_gui.c:1442) ORs exactly
+   these two bits onto whatever mask_mode already had (so an existing
+   parametric/raster mask stays enabled too); this binding replicates that
+   OR (never a plain assignment, so other mask_mode bits already set by
+   set_raster_source/mask_raster/mask_object survive untouched) so a module
+   attached here actually shows/applies the mask without the user having to
+   click the pencil icon manually. The result table's mask_mode is read back
+   from module->blend_params AFTER the write (not the value we computed) so
+   a caller can verify the bit really stuck rather than trusting the call
+   succeeded silently.
+
+   Mutates dev->forms / blend group / blend_params, commits history via
+   dt_dev_add_masks_history_item -> MUST run on the GUI thread. */
+static int attach_mask_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = (int)luaL_optinteger(L, 2, 0);
+  const dt_mask_id_t formid = (dt_mask_id_t)luaL_checkinteger(L, 3);
+  const char *operation = luaL_optstring(L, 4, "union");
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+  if(!module->blend_params || !module->flags || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    return push_error(L, "module '%s' does not support blending", op);
+
+  dt_masks_form_t *form = dt_masks_get_from_id(dev, formid);
+  if(!form)
+    return push_error(L, "mask %d not found in darkroom forms", formid);
+  if(form->type & DT_MASKS_GROUP)
+    return push_error(L, "mask %d is a module blend group, not an attachable shape", formid);
+
+  uint32_t state_bit;
+  if(!g_strcmp0(operation, "union"))             state_bit = DT_MASKS_STATE_UNION;
+  else if(!g_strcmp0(operation, "intersection")) state_bit = DT_MASKS_STATE_INTERSECTION;
+  else if(!g_strcmp0(operation, "difference"))   state_bit = DT_MASKS_STATE_DIFFERENCE;
+  else if(!g_strcmp0(operation, "exclusion"))    state_bit = DT_MASKS_STATE_EXCLUSION;
+  else
+    return push_error(L, "unknown operation '%s' (expected union/intersection/difference/exclusion)",
+                      operation);
+
+  dt_masks_form_t *grp = dt_masks_group_ensure_for_module(dev, module);
+  if(!grp)
+    return push_error(L, "could not create blend group for module '%s'", op);
+
+  dt_masks_point_group_t *grpt = dt_masks_group_add_form(grp, form);
+  if(!grpt)
+    return push_error(L, "mask %d cannot be attached (would contain itself)", formid);
+  grpt->state = DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW | state_bit;
+
+  // Bugreport 2026-07-27: attaching a shape to the group is not enough --
+  // the drawn-mask bits still need to be ON for the pipeline to use it (see
+  // the long comment above). OR, never assign, so any bits set by
+  // set_raster_source/mask_raster/mask_object (raster/conditional) survive.
+  module->blend_params->mask_mode |= (DEVELOP_MASK_MASK | DEVELOP_MASK_ENABLED);
+
+  dt_dev_add_masks_history_item(dev, module, TRUE);
+  dt_masks_iop_update(module);
+  dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);                    lua_setfield(L, -2, "ok");
+  lua_pushstring(L, module->op);               lua_setfield(L, -2, "op");
+  lua_pushinteger(L, module->multi_priority);  lua_setfield(L, -2, "instance");
+  lua_pushinteger(L, formid);                  lua_setfield(L, -2, "formid");
+  lua_pushstring(L, operation);                lua_setfield(L, -2, "operation");
+  // Read back from the live struct (not the value we just computed) so a
+  // caller can verify the drawn-mask bit really stuck instead of trusting
+  // the write silently.
+  lua_pushinteger(L, (lua_Integer)module->blend_params->mask_mode);
+  lua_setfield(L, -2, "mask_mode");
+  return 1;
+}
+
+/* darktable.develop.detach_mask(op, instance, formid)
+   Unwire a drawn mask shape from module (op, instance)'s blend group WITHOUT
+   deleting the shape itself. dt_masks_form_remove(module, grp, form) with a
+   non-NULL grp only drops the dt_masks_point_group_t link node (masks.c:
+   1891-1922), the underlying form survives in dev->forms and can be
+   re-attached to any module (this one or another) via attach_mask().
+
+   If this was the LAST shape in the group, dt_masks_form_remove recurses into
+   a full group deletion (masks.c:1920, grp->points == NULL) and resets
+   blend_params->mask_id to NO_MASKID on every module that referenced that
+   now-empty group (masks.c:1949-1953) -- expected, mirrors exactly what the
+   GUI's own "no masks" action does (_menu_no_masks, masks.c:1611).
+
+   dt_masks_form_remove commits history itself (dt_dev_add_masks_history_item,
+   masks.c:1917, or dt_dev_add_history_item on the full-delete path) -> this
+   entire call MUST run on the GUI thread. */
+static int detach_mask_cb(lua_State *L)
+{
+  const char *op = luaL_checkstring(L, 1);
+  const int instance = (int)luaL_optinteger(L, 2, 0);
+  const dt_mask_id_t formid = (dt_mask_id_t)luaL_checkinteger(L, 3);
+
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->iop)
+    return push_error(L, "no darkroom image loaded");
+
+  dt_iop_module_t *module = _find_module(dev, op, instance);
+  if(!module)
+    return push_error(L, "no module '%s' instance %d in current darkroom", op, instance);
+  if(!module->blend_params)
+    return push_error(L, "module '%s' has no blend params", op);
+
+  dt_masks_form_t *grp = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  if(!grp || !(grp->type & DT_MASKS_GROUP))
+    return push_error(L, "module '%s' instance %d has no shapes group", op, instance);
+
+  dt_masks_form_t *form = dt_masks_get_from_id(dev, formid);
+  if(!form)
+    return push_error(L, "mask %d not found in darkroom forms", formid);
+
+  gboolean present = FALSE;
+  for(GList *pts = grp->points; pts; pts = g_list_next(pts))
+  {
+    dt_masks_point_group_t *pg = (dt_masks_point_group_t *)pts->data;
+    if(pg && pg->formid == formid) { present = TRUE; break; }
+  }
+  if(!present)
+    return push_error(L, "mask %d is not attached to module '%s' instance %d", formid, op, instance);
+
+  dt_masks_form_remove(module, grp, form);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);                    lua_setfield(L, -2, "ok");
+  lua_pushstring(L, module->op);               lua_setfield(L, -2, "op");
+  lua_pushinteger(L, module->multi_priority);  lua_setfield(L, -2, "instance");
+  lua_pushinteger(L, formid);                  lua_setfield(L, -2, "formid");
+  return 1;
+}
+
 /* Push {x=.., y=..} from a float[2] under `key` of the table at top of stack. */
 static void _push_xy(lua_State *L, const char *key, const float xy[2])
 {
@@ -3049,12 +3485,29 @@ static void _push_xy(lua_State *L, const char *key, const float xy[2])
   lua_setfield(L, -2, key);
 }
 
+/* Map a dt_masks_point_group_t's state bits to the boolean-combine operation
+   name (masks.h DT_MASKS_STATE_* bits) so callers can see how each shape
+   combines with the OTHERS already in the group, and pick the same set of
+   names attach_mask()/set_module_mask() accept. Falls back to "union" (the
+   default dt_masks_group_add_form assigns, masks.c:2098) when no explicit
+   operator bit is set -- true for the first shape added to an empty group. */
+static const char *_mask_state_operation_name(int state)
+{
+  if(state & DT_MASKS_STATE_INTERSECTION) return "intersection";
+  if(state & DT_MASKS_STATE_DIFFERENCE)   return "difference";
+  if(state & DT_MASKS_STATE_EXCLUSION)    return "exclusion";
+  return "union";
+}
+
 /* darktable.develop.list_masks(op, instance)
    Read-only: enumerate the drawn masks wired into a module instance's blend
    group, so a caller knows EXACTLY which mask_id it is about to edit (and does
    not clobber a stale instance). Returns [] when the module has no drawn masks.
-   Each entry: {mask_id, type, opacity, nb_points, name, module, instance}.
-   Reads live dev->forms -> registered wrapped in dt_lua_gtk_wrap. */
+   Each entry: {mask_id, type, opacity, nb_points, name, module, instance,
+   operation, invert}. operation/invert (added alongside attach_mask/
+   detach_mask) report the boolean-combine bits already stored per shape --
+   this is the same list a module's mask manager panel shows, just read-only
+   and headless. Reads live dev->forms -> registered wrapped in dt_lua_gtk_wrap. */
 static int list_masks_cb(lua_State *L)
 {
   dt_develop_t *dev = darktable.develop;
@@ -3084,6 +3537,9 @@ static int list_masks_cb(lua_State *L)
     lua_pushstring(L, f->name);                                lua_setfield(L, -2, "name");
     lua_pushstring(L, op);                                     lua_setfield(L, -2, "module");
     lua_pushinteger(L, instance);                              lua_setfield(L, -2, "instance");
+    lua_pushstring(L, _mask_state_operation_name(pg->state));  lua_setfield(L, -2, "operation");
+    lua_pushboolean(L, (pg->state & DT_MASKS_STATE_INVERSE) ? TRUE : FALSE);
+    lua_setfield(L, -2, "invert");
     lua_rawseti(L, -2, idx++);
   }
   return 1;
@@ -3185,6 +3641,12 @@ int dt_lua_init_develop(lua_State *L)
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "version");
 
+  // get_conf_string(key): dt_conf_get_string() has its own mutex, no
+  // GUI-thread marshaling needed (see get_conf_string_cb comment).
+  lua_pushcfunction(L, get_conf_string_cb);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "get_conf_string");
+
   // active_modules(): reads live develop state -> wrap onto the GUI thread.
   lua_pushcfunction(L, active_modules_cb);
   dt_lua_gtk_wrap(L);
@@ -3225,9 +3687,10 @@ int dt_lua_init_develop(lua_State *L)
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "enable_module");
 
-  // add_instance(op): duplicates a module via the GUI new-instance path
-  // (dt_iop_gui_duplicate). Writes live develop/GUI state -> MUST run on the
-  // GUI thread.
+  // add_instance(op[, fields]): duplicates a module via the GUI new-instance
+  // path (dt_iop_gui_duplicate), optionally applying initial param overrides
+  // (fields) via a nested set_params_cb call. Writes live develop/GUI state
+  // -> MUST run on the GUI thread.
   lua_pushcfunction(L, add_instance_cb);
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
@@ -3273,6 +3736,19 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "set_raster_source");
+
+  // get_blend_params(op, instance): reads live blend_params -> GUI thread.
+  lua_pushcfunction(L, get_blend_params_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "get_blend_params");
+
+  // set_blend_params(op, instance, {..}): writes blend_params + commits
+  // history via dt_dev_add_history_item -> MUST run on the GUI thread.
+  lua_pushcfunction(L, set_blend_params_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "set_blend_params");
 
   // history_count(): read-only diagnostic for coalescing observation.
   lua_pushcfunction(L, history_count_cb);
@@ -3324,6 +3800,31 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "get_mask");
+
+  // list_all_masks(): read-only enumeration of EVERY drawn shape in the
+  // current image (dev->forms), independent of which module uses it, plus
+  // used_by (op/instance list per shape). Reads live dev->forms/dev->iop ->
+  // GUI thread.
+  lua_pushcfunction(L, list_all_masks_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "list_all_masks");
+
+  // attach_mask(op, instance, formid[, operation]): wire an EXISTING shape
+  // into a module's blend group without copying it. Mutates dev->forms/blend
+  // group/blend_params/history -> MUST run on the GUI thread.
+  lua_pushcfunction(L, attach_mask_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "attach_mask");
+
+  // detach_mask(op, instance, formid): unwire a shape from a module's blend
+  // group WITHOUT deleting it. Mutates blend group/blend_params/history ->
+  // MUST run on the GUI thread.
+  lua_pushcfunction(L, detach_mask_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "detach_mask");
 
   // preview(max_w, max_h): grabs the live preview_pipe backbuf and encodes a
   // PNG, with NO DB write. Registered DELIBERATELY WITHOUT dt_lua_gtk_wrap:

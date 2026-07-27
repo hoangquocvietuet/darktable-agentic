@@ -3508,6 +3508,18 @@ void dt_masks_iop_use_same_as(dt_iop_module_t *module,
   dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 }
 
+dt_masks_form_t *dt_masks_group_ensure_for_module(dt_develop_t *dev,
+                                                  dt_iop_module_t *module)
+{
+  if(!module) return NULL;
+  // the module's blend (flexi) group, created with its marker exactly as
+  // dt_masks_group_insert_point() does for a flexi element
+  dt_masks_form_t *grp = _group_from_module(dev, module, FALSE);
+  if(!grp)
+    grp = dt_masks_module_group_create(dev, module);
+  return grp;
+}
+
 void dt_masks_iop_update(dt_iop_module_t *module)
 {
   if(!module) return;
