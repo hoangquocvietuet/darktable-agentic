@@ -87,7 +87,23 @@
 // heal/clone from blur/fill). Purely additive at the wire level: every
 // existing positional argument keeps its meaning and position; old callers
 // passing only heal/clone are unaffected. All API-7 fields kept.
-#define DT_LUA_DEVELOP_API 8
+// API 9 (2026-07-31, ellipse step 1/N of the deferred shape_type item):
+// retouch_add_shape gains optional shape_type ("circle" default, "ellipse"),
+// radius_b, and rotation trailing args -- ellipse.c's own
+// _points_to_transform confirms radius_a/radius_b both scale by
+// MIN(width,height), same mindim convention as circle's radius, so no new
+// normalization rule. radius_b defaults to `radius` if omitted (a
+// circle-shaped ellipse). DT_MASKS_CLONE is used unconditionally regardless
+// of shape_type, matching the pre-existing (confirmed working) circle
+// behavior -- deliberately NOT switched to DT_MASKS_NON_CLONE for blur/fill
+// to match the GUI's own rt_add_shape, since nothing in rt_process_forms
+// keys off that bit and changing it would be unproven risk for zero
+// benefit. retouch_update_shape/retouch_list_shapes remain circle-only for
+// now (ellipse read/move is a separate step; list_shapes reports
+// shape_type="unknown" for an ellipse without crashing, same as any other
+// pre-existing GUI-made non-circle shape). Purely additive at the wire
+// level. All API-8 fields kept.
+#define DT_LUA_DEVELOP_API 9
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -3106,16 +3122,31 @@ static const char *rt_fill_mode_to_string(dt_iop_retouch_fill_modes_t m)
  * [, blur_type][, blur_radius][, fill_mode][, fill_r][, fill_g][, fill_b]
  * [, fill_brightness])
  * ===========================================================================
- * Create a CIRCLE retouch shape (heal, clone, blur, or fill -- circle is the
- * only SHAPE supported in this build; ellipse/path/brush are a later phase)
- * and bind it to a wavelet scale. Runs on the GUI thread (dt_lua_gtk_wrap).
+ * Create a retouch shape (heal, clone, blur, or fill; circle or ellipse --
+ * path/brush are a later phase, see docs/superpowers/specs/2026-07-31-
+ * retouch-ellipse-path-shapes-design.md) and bind it to a wavelet scale.
+ * Runs on the GUI thread (dt_lua_gtk_wrap).
  *
  * ARGS
  *   op, instance   must resolve to the "retouch" module -- this binding
  *                  assumes the retouch params layout, unlike add_path_mask.
  *   algorithm      "heal", "clone", "blur", or "fill".
  *   target_x/y     shape center, normalized [0,1] image coords, clamped.
- *   radius/feather normalized, clamped to [0.0005, 0.5] / [0, 0.5].
+ *   radius/feather normalized, clamped to [0.0005, 0.5] / [0, 0.5]. For
+ *                  shape_type="ellipse", `radius` is the FIRST semi-axis
+ *                  (radius_a) and `feather` is the border -- same mindim-
+ *                  normalized convention as circle's radius/border
+ *                  (confirmed via ellipse.c's _points_to_transform: both
+ *                  radius_a and radius_b scale by MIN(width,height), same
+ *                  as circle's radius).
+ *   shape_type     optional "circle" (default) or "ellipse".
+ *   radius_b       ellipse's SECOND semi-axis, same normalization as
+ *                  radius/radius_a; only used when shape_type="ellipse".
+ *                  Defaults to `radius` (a circle-shaped ellipse) if
+ *                  omitted -- ellipse with unequal axes needs this set
+ *                  explicitly.
+ *   rotation       ellipse rotation in degrees; only used when
+ *                  shape_type="ellipse". Default 0.
  *   source_x/y     required for heal/clone (the point to sample from);
  *                  ignored (nil is fine) for blur/fill, which only ever
  *                  read/write the target area, never a separate source.
@@ -3151,7 +3182,8 @@ static const char *rt_fill_mode_to_string(dt_iop_retouch_fill_modes_t m)
  * Returns {ok=true, op, instance, formid, mask_id, algorithm, shape_type,
  * target={x,y}, radius, feather, opacity, wavelet_scale, source={x,y}
  * (heal/clone only), blur_type, blur_radius (blur only), fill_mode,
- * fill_color={r,g,b}, fill_brightness (fill only)} or {error=...}. */
+ * fill_color={r,g,b}, fill_brightness (fill only), radius_b, rotation
+ * (ellipse only)} or {error=...}. */
 static int retouch_add_shape_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3187,6 +3219,15 @@ static int retouch_add_shape_cb(lua_State *L)
   const double fill_b_arg = luaL_optnumber(L, 17, 0.0);
   const gboolean has_fill_brightness = !lua_isnoneornil(L, 18);
   const double fill_brightness_arg = luaL_optnumber(L, 18, 0.0);
+  const char *shape_type_str = lua_isnoneornil(L, 19) ? "circle" : luaL_checkstring(L, 19);
+  const gboolean has_radius_b = !lua_isnoneornil(L, 20);
+  const double radius_b_arg = luaL_optnumber(L, 20, 0.0);
+  const double rotation_arg = luaL_optnumber(L, 21, 0.0);
+
+  const gboolean is_ellipse = !g_strcmp0(shape_type_str, "ellipse");
+  if(!is_ellipse && g_strcmp0(shape_type_str, "circle"))
+    return push_error(L, "retouch_add_shape: unsupported shape_type '%s' "
+                          "(must be 'circle' or 'ellipse')", shape_type_str);
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -3231,25 +3272,54 @@ static int retouch_add_shape_cb(lua_State *L)
   const double source_x = CLAMPS(source_x_arg, 0.0, 1.0);
   const double source_y = CLAMPS(source_y_arg, 0.0, 1.0);
   const double radius = CLAMPS(radius_arg, 0.0005, 0.5);
+  const double radius_b = CLAMPS(has_radius_b ? radius_b_arg : radius_arg, 0.0005, 0.5);
+  const double rotation = rotation_arg;
   const double feather = CLAMPS(feather_arg, 0.0, 0.5);
   const double opacity = CLAMPS(opacity_arg, 0.0, 1.0);
   const int scale = (scale_arg < 0) ? p->curr_scale : (int)CLAMPS(scale_arg, 0, RETOUCH_MAX_SCALES + 1);
 
-  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE | DT_MASKS_CLONE);
+  // DT_MASKS_CLONE unconditionally, same as the existing (shipped, confirmed
+  // working) circle path -- blur/fill's rt_process_forms branch keys off
+  // p->rt_forms[index].algorithm, never off this masks-subsystem type bit
+  // (see retouch_list_shapes_cb's algorithm-based, not type-based, `source`
+  // gate below), so there is no proven benefit to matching the GUI's own
+  // CLONE/NON_CLONE choice here and real risk in changing already-working
+  // behavior for an unrelated (ellipse) change.
+  dt_masks_form_t *form = dt_masks_create((is_ellipse ? DT_MASKS_ELLIPSE : DT_MASKS_CIRCLE) | DT_MASKS_CLONE);
   if(!form)
     return push_error(L, "dt_masks_create failed");
 
-  dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
-  if(!circle)
+  if(is_ellipse)
   {
-    dt_masks_free_form(form);
-    return push_error(L, "out of memory building circle shape");
+    dt_masks_point_ellipse_t *ellipse = malloc(sizeof(dt_masks_point_ellipse_t));
+    if(!ellipse)
+    {
+      dt_masks_free_form(form);
+      return push_error(L, "out of memory building ellipse shape");
+    }
+    ellipse->center[0] = (float)target_x;
+    ellipse->center[1] = (float)target_y;
+    ellipse->radius[0] = (float)radius;
+    ellipse->radius[1] = (float)radius_b;
+    ellipse->rotation = (float)rotation;
+    ellipse->border = (float)feather;
+    ellipse->flags = DT_MASKS_ELLIPSE_EQUIDISTANT;
+    form->points = g_list_append(form->points, ellipse);
   }
-  circle->center[0] = (float)target_x;
-  circle->center[1] = (float)target_y;
-  circle->radius = (float)radius;
-  circle->border = (float)feather;
-  form->points = g_list_append(form->points, circle);
+  else
+  {
+    dt_masks_point_circle_t *circle = malloc(sizeof(dt_masks_point_circle_t));
+    if(!circle)
+    {
+      dt_masks_free_form(form);
+      return push_error(L, "out of memory building circle shape");
+    }
+    circle->center[0] = (float)target_x;
+    circle->center[1] = (float)target_y;
+    circle->radius = (float)radius;
+    circle->border = (float)feather;
+    form->points = g_list_append(form->points, circle);
+  }
 
   form->source[0] = needs_source ? (float)source_x : 0.0f;
   form->source[1] = needs_source ? (float)source_y : 0.0f;
@@ -3313,7 +3383,7 @@ static int retouch_add_shape_cb(lua_State *L)
   lua_pushinteger(L, (lua_Integer)formid);         lua_setfield(L, -2, "formid");
   lua_pushinteger(L, (lua_Integer)mask_id);        lua_setfield(L, -2, "mask_id");
   lua_pushstring(L, rt_algo_to_string(algorithm)); lua_setfield(L, -2, "algorithm");
-  lua_pushstring(L, "circle");                     lua_setfield(L, -2, "shape_type");
+  lua_pushstring(L, is_ellipse ? "ellipse" : "circle"); lua_setfield(L, -2, "shape_type");
   lua_newtable(L);
   lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
   lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
@@ -3329,6 +3399,11 @@ static int retouch_add_shape_cb(lua_State *L)
   lua_pushnumber(L, feather);  lua_setfield(L, -2, "feather");
   lua_pushnumber(L, opacity);  lua_setfield(L, -2, "opacity");
   lua_pushinteger(L, scale);   lua_setfield(L, -2, "wavelet_scale");
+  if(is_ellipse)
+  {
+    lua_pushnumber(L, radius_b); lua_setfield(L, -2, "radius_b");
+    lua_pushnumber(L, rotation); lua_setfield(L, -2, "rotation");
+  }
   if(algorithm == DT_IOP_RETOUCH_BLUR)
   {
     lua_pushstring(L, rt_blur_type_to_string(blur_type)); lua_setfield(L, -2, "blur_type");
