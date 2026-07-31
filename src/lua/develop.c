@@ -2224,32 +2224,121 @@ static int restore_viewport_cb(lua_State *L)
   return 1;
 }
 
-/* GUI-thread snapshot + conditional (re)trigger of the preview worker. */
+/* GUI-thread snapshot + conditional (re)trigger of the preview worker.
+
+   VIEWPORT SELECTOR (2026-07-31, extending set_viewport's own fix): `in`
+   `viewport_name` picks WHICH pipe this grabs a backbuf from --
+   NULL/""/"preview_pipe" (the original, default behavior, unchanged for
+   every existing caller) reads dev->preview_pipe, a FIXED-native-resolution
+   full-frame pipe entirely independent of any darkroom zoom (confirmed:
+   dt_dev_process_preview_job_run processes it with port=NULL). "main"/
+   "preview2" instead read dev->full.pipe / dev->preview2.pipe -- the SAME
+   pipes set_viewport's dt_dev_zoom_move actually zooms, and the SAME ones
+   the darkroom GUI itself paints the center view from (views/darkroom.c's
+   expose path just cairo-paints this exact backbuf, scaled by zoom_scale --
+   confirmed by reading dt_dev_pixelpipe_process's terminal backbuf write,
+   pixelpipe_hb.c:3277-3309: it is UNCONDITIONAL for every pipe type except a
+   distinct 4-float encoding for dt_pipe_is_screen, so dev->full.pipe gets a
+   backbuf/backbuf_width/backbuf_height/backbuf_mutex populated the exact
+   same way preview_pipe's already is). Because dt_dev_process_image_job
+   computes x,y,wd,ht FROM THE CURRENT zoom_x/zoom_y/scale (develop.c:
+   769-784) and wd/ht are capped by the WINDOW size (not by any fixed
+   preview budget), a tight zoom devotes the window's ENTIRE fixed pixel
+   budget to a small region -- this is the actual mechanism that makes
+   "zoom in for more detail" work, and it is what was MISSING before: this
+   binding used to always read preview_pipe regardless of viewport, so
+   set_viewport's zoom changed WHAT get_viewport().region reported but
+   never what capture_viewport's pixels actually were.
+
+   FRESHNESS is likewise pipe-appropriate: content edits (dt_dev_add_
+   history_item -> dt_dev_invalidate_all, develop.c:314) mark ALL THREE
+   pipes DIRTY and bump dev->timestamp UNIFORMLY, so the timestamp check
+   below is already correct for main/preview2 exactly as it always was for
+   preview_pipe. But a PURE ZOOM/PAN change (dt_dev_zoom_move) does NOT
+   bump dev->timestamp at all (only content edits do) -- it only sets
+   port->pipe->changed |= DT_DEV_PIPE_ZOOMED (develop.c:3388), cleared once
+   dt_dev_process_image_job actually re-runs at the new zoom (develop.c:
+   788,837-858). So for main/preview2 this ALSO requires that bit clear --
+   exactly the same freshness signal set_viewport_cb's own wait_for_pipe
+   already uses, and for the same reason (see the long note above
+   _viewport_op_apply_gui). preview_pipe never has this bit touched (zoom
+   never applies to it), so the extra check is a harmless no-op there --
+   gated on check_zoomed anyway to keep the two cases visibly distinct. */
 typedef struct
 {
-  gboolean in_darkroom;      // out: dev in darkroom with an image loaded
-  int want_ts;               // out: dev->timestamp we require the frame to match
-  dt_dev_pixelpipe_t *pp;    // out: the preview pipe pointer (stable while in darkroom)
+  const char *viewport_name; // in: NULL/""/"preview_pipe" (default), "main", "preview2"
+  gboolean in_darkroom;       // out: dev in darkroom with an image loaded
+  gboolean viewport_not_active; // out: preview2 requested but its window is not open
+  gboolean check_zoomed;      // out: TRUE for main/preview2 (needs the extra freshness bit)
+  int want_ts;                // out: dev->timestamp we require the frame to match
+  dt_dev_pixelpipe_t *pp;     // out: the resolved pipe pointer (stable while in darkroom)
 } preview_snapshot_t;
 
 static void _preview_snapshot_gui(void *data)
 {
   preview_snapshot_t *s = (preview_snapshot_t *)data;
   dt_develop_t *dev = darktable.develop;
-  if(!dev || !dev->gui_attached || !dev->preview_pipe
-     || !dt_is_valid_imgid(dev->image_storage.id))
+  if(!dev || !dev->gui_attached || !dt_is_valid_imgid(dev->image_storage.id))
   {
     s->in_darkroom = FALSE;
     return;
   }
+
+  dt_dev_pixelpipe_t *pp = NULL;
+  void (*trigger)(dt_develop_t *) = NULL;
+  gboolean check_zoomed = FALSE;
+
+  const gboolean is_default = !s->viewport_name || !s->viewport_name[0]
+                              || !g_strcmp0(s->viewport_name, "preview_pipe");
+  if(is_default)
+  {
+    if(!dev->preview_pipe) { s->in_darkroom = FALSE; return; }
+    pp = dev->preview_pipe;
+    trigger = dt_dev_process_preview;
+  }
+  else if(!g_strcmp0(s->viewport_name, "main"))
+  {
+    pp = dev->full.pipe;
+    trigger = dt_dev_process_image;
+    check_zoomed = TRUE;
+  }
+  else if(!g_strcmp0(s->viewport_name, "preview2"))
+  {
+    const gboolean p2_active = (dev->second_wnd != NULL) && (dev->preview2.widget != NULL);
+    if(!p2_active)
+    {
+      s->in_darkroom = FALSE;
+      s->viewport_not_active = TRUE;
+      return;
+    }
+    pp = dev->preview2.pipe;
+    trigger = dt_dev_process_preview2;
+    check_zoomed = TRUE;
+  }
+  else
+  {
+    s->in_darkroom = FALSE; // unknown name -- defensive only, preview_cb already validates
+    return;
+  }
+
+  if(!pp)
+  {
+    s->in_darkroom = FALSE;
+    return;
+  }
+
   s->in_darkroom = TRUE;
-  s->pp = dev->preview_pipe;
+  s->pp = pp;
+  s->check_zoomed = check_zoomed;
   s->want_ts = (int)dev->timestamp;
-  // Only kick a fresh worker if the current backbuf is not already a fresh
-  // VALID frame for this edit; avoids a redundant re-render on a plain
-  // (no preceding set_params) preview() call.
-  if(!(s->pp->status == DT_DEV_PIXELPIPE_VALID && s->pp->input_timestamp >= s->want_ts))
-    dt_dev_process_preview(dev);
+  // Only kick a fresh worker if the current backbuf is not already fresh
+  // for BOTH signals that matter for this pipe; avoids a redundant re-render
+  // on a plain (no preceding set_params/set_viewport) preview() call.
+  const gboolean already_fresh =
+    pp->status == DT_DEV_PIXELPIPE_VALID && pp->input_timestamp >= s->want_ts
+    && (!check_zoomed || !(pp->changed & DT_DEV_PIPE_ZOOMED));
+  if(!already_fresh)
+    trigger(dev);
 }
 
 /* Write an 8-bit RGB buffer (tightly packed, w*h*3) to a PNG file via libpng
@@ -2448,15 +2537,36 @@ static int preview_cb(lua_State *L)
     has_region = TRUE;
   }
 
+  // VIEWPORT (2026-07-31, arg 7, optional): "main" | "preview2" read from
+  // dev->full.pipe / dev->preview2.pipe instead of the default
+  // dev->preview_pipe -- see the long note on preview_snapshot_t/
+  // _preview_snapshot_gui above for why this is the fix that makes
+  // set_viewport's zoom actually show up here. Omitted (or nil): ZERO
+  // change from the original preview_pipe behavior, for every existing
+  // caller (get_preview's grain/sharpen/noise-inspection use, etc). When
+  // given, `region` above (if also given) is relative to what THIS pipe's
+  // backbuf currently shows -- for "main"/"preview2" while zoomed in, that
+  // is the CURRENT on-screen crop, not the full image (exactly the same
+  // "relative to the frame the pipe produced" contract this parameter
+  // already had for preview_pipe -- no new semantics, just a different pipe).
+  const char *viewport_name = lua_isnoneornil(L, 7) ? NULL : luaL_checkstring(L, 7);
+  if(viewport_name && g_strcmp0(viewport_name, "main") && g_strcmp0(viewport_name, "preview2"))
+    return push_error(L, "viewport must be 'main' or 'preview2' (or omitted for preview_pipe)");
+
   // (a) GUI-thread snapshot + conditional (re)trigger of the preview worker.
-  preview_snapshot_t snap = { .in_darkroom = FALSE, .want_ts = 0, .pp = NULL };
+  preview_snapshot_t snap = { .viewport_name = viewport_name, .in_darkroom = FALSE,
+                              .viewport_not_active = FALSE, .check_zoomed = FALSE,
+                              .want_ts = 0, .pp = NULL };
   _run_on_gui_sync(_preview_snapshot_gui, &snap);
 
+  if(snap.viewport_not_active)
+    return push_error(L, "viewport_not_active: preview2 window is not open");
   if(!snap.in_darkroom || !snap.pp)
     return push_error(L, "not in darkroom / no image loaded");
 
   dt_dev_pixelpipe_t *pp = snap.pp;
   const int want_ts = snap.want_ts;
+  const gboolean check_zoomed = snap.check_zoomed;
 
   // (b) bounded sleep-poll on the LUA thread for a FRESH VALID frame (§3.4
   // timeout 2000 ms). Sleeping here releases the Lua lock and never touches the
@@ -2467,7 +2577,8 @@ static int preview_cb(lua_State *L)
   gboolean fresh = FALSE;
   while(waited < timeout_ms)
   {
-    if(pp->status == DT_DEV_PIXELPIPE_VALID && pp->input_timestamp >= want_ts)
+    if(pp->status == DT_DEV_PIXELPIPE_VALID && pp->input_timestamp >= want_ts
+       && (!check_zoomed || !(pp->changed & DT_DEV_PIPE_ZOOMED)))
     {
       fresh = TRUE;
       break;
@@ -2559,6 +2670,10 @@ static int preview_cb(lua_State *L)
   // normalized and backbuf-pixel terms, so a caller can verify the crop.
   lua_pushinteger(L, bw); lua_setfield(L, -2, "frame_width");
   lua_pushinteger(L, bh); lua_setfield(L, -2, "frame_height");
+  // Which pipe this actually came from -- never ambiguous which source a
+  // given render's detail level should be attributed to.
+  lua_pushstring(L, viewport_name ? viewport_name : "preview_pipe");
+  lua_setfield(L, -2, "viewport_source");
   if(has_region)
   {
     lua_newtable(L);
