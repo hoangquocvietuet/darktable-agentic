@@ -1490,6 +1490,72 @@ static int get_viewport_cb(lua_State *L)
   return 1;
 }
 
+/* Single, NON-BLOCKING freshness check used by backtransform_point_cb,
+ * transform_point_cb and retouch_list_shapes_cb before they trust
+ * dt_masks_get_image_size()'s output (2026-07-31 investigation, see
+ * docs/superpowers/specs/2026-07-31-mask-get-image-size-race-investigation.md).
+ *
+ * WHAT WAS INVESTIGATED: the spec's own hypothesis -- that dev->full.pipe's
+ * processed_width/height shrinks to the visible ZOOM sub-region and leaks
+ * into dt_masks_get_image_size()'s fallback branch -- was traced through
+ * dt_dev_pixelpipe_get_dimensions() (pixelpipe_hb.c) and REFUTED:
+ * processed_width/height is always computed by walking modify_roi_out from
+ * the pipe's full iwidth/iheight, never from the on-screen zoom/pan window
+ * (that window -- x/y/wd/ht in dt_dev_process_image_job, develop.c -- is a
+ * SEPARATE quantity, never written back into processed_width). Zoom is not
+ * the trigger.
+ *
+ * WHAT ACTUALLY REPRODUCES THE REPORTED SYMPTOM (mask frame correct, display
+ * frame silently missing the active crop offset, as if only rotation had
+ * been applied): dt_dev_pixelpipe_change() (pixelpipe_hb.c) rebuilds
+ * preview_pipe's piece list (cleanup_nodes+create_nodes, a fresh, zeroed
+ * dt_dev_pixelpipe_iop_t per module) UNDER dev->history_mutex, then RELEASES
+ * that mutex, and only AFTERWARDS -- NOT under history_mutex -- calls
+ * dt_dev_pixelpipe_get_dimensions(), which is what actually populates each
+ * piece's buf_in (and, at the very end, pipe->processed_width). crop.c's
+ * distort_transform()/distort_backtransform() (_get_crop_offset) read that
+ * same piece->buf_in to compute the crop offset, and silently treat a
+ * zeroed/stale buf_in as "no crop" (distort_transform's own
+ * `if(crop_top <= 0.0f && crop_left <= 0.0f) return TRUE;` early-out) --
+ * exactly the observed "bare rotation, crop ignored" result. Because
+ * pipe->processed_width is NOT reset when the piece list is rebuilt (only
+ * dt_dev_load_image resets it, and only for dev->full.pipe -- see
+ * develop.c:1011), a Lua call landing in the gap between "nodes rebuilt" and
+ * "get_dimensions finished" can see processed_width still holding a
+ * stale-but-positive value from the PREVIOUS generation while the CURRENT
+ * generation's crop piece still has a zeroed buf_in. This means the existing
+ * `wd <= 0 || ht <= 0 || ...` guards (which only catch "never rendered") do
+ * NOT catch this window -- confirming the fix must be a real freshness
+ * check, not a >0 check.
+ *
+ * THE FIX: reuse the EXACT freshness formula preview_cb already relies on
+ * (see preview_cb's own long threading note below: `status ==
+ * DT_DEV_PIXELPIPE_VALID && input_timestamp >= dev->timestamp`,
+ * synchronised via dt_dev_invalidate_all()/dt_dev_invalidate() bumping
+ * dev->timestamp and marking preview_pipe DIRTY synchronously on the GUI
+ * thread on every edit, develop.c:304-323) -- but as a single, non-blocking
+ * check, NOT a sleep-poll wait. preview_cb can safely sleep-poll because it
+ * deliberately runs UNWRAPPED on the Lua thread for exactly that reason (see
+ * its note). backtransform_point_cb/transform_point_cb/retouch_list_shapes_cb
+ * are all dt_lua_gtk_wrap'd -- they run ON the GUI thread -- and the preview
+ * pipe's worker runs on a SEPARATE thread; a sleep-poll here would freeze
+ * the whole darktable UI for the wait's duration, which is exactly what
+ * preview_cb's design avoids. So: on a fresh pipe, proceed exactly as
+ * before (zero added latency); when NOT fresh, don't trust the transform
+ * for this call -- nudge a re-render for the next attempt and let the
+ * caller retry (see call sites for how each one degrades: an explicit
+ * retryable error for backtransform_point_cb/transform_point_cb, an omitted
+ * *_display field for retouch_list_shapes_cb, matching the existing
+ * have_display precedent for "genuinely unavailable"). */
+static gboolean _mask_pipe_is_fresh(const dt_develop_t *dev)
+{
+  const dt_dev_pixelpipe_t *pp = dev->preview_pipe;
+  // cast dev->timestamp (uint32_t) like _preview_snapshot_gui's want_ts does,
+  // to compare against the signed int input_timestamp the same way preview_cb does.
+  return pp && pp->status == DT_DEV_PIXELPIPE_VALID
+         && pp->input_timestamp >= (int)dev->timestamp;
+}
+
 /* darktable.develop.backtransform_point(x, y[, len1][, len2])
  * ===========================================================================
  * Convert a point NORMALIZED 0..1 against the CURRENT PROCESSED/display
@@ -1545,6 +1611,17 @@ static int backtransform_point_cb(lua_State *L)
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
     return push_error(L, "no darkroom image loaded");
+
+  // Freshness check BEFORE trusting dt_masks_get_image_size()'s output --
+  // see the long note above _mask_pipe_is_fresh: a stale/mid-rebuild pipe can
+  // return individually-positive wd/ht/iwidth/iheight while a module's
+  // (e.g. crop's) piece->buf_in is still zeroed from a just-rebuilt piece
+  // list, silently dropping that module's offset from the transform below.
+  if(!_mask_pipe_is_fresh(dev))
+  {
+    dt_dev_process_preview(dev); // nudge a refresh so a retry can succeed
+    return push_error(L, "backtransform_point: preview pipe mid-refresh, retry");
+  }
 
   float wd, ht, iwidth, iheight;
   dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
@@ -1662,6 +1739,14 @@ static int transform_point_cb(lua_State *L)
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
     return push_error(L, "no darkroom image loaded");
+
+  // Freshness check BEFORE trusting dt_masks_get_image_size()'s output --
+  // see the long note above _mask_pipe_is_fresh.
+  if(!_mask_pipe_is_fresh(dev))
+  {
+    dt_dev_process_preview(dev); // nudge a refresh so a retry can succeed
+    return push_error(L, "transform_point: preview pipe mid-refresh, retry");
+  }
 
   float wd, ht, iwidth, iheight;
   dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
@@ -2868,10 +2953,21 @@ static int retouch_list_shapes_cb(lua_State *L)
   // dims for the mask -> display frame conversion (COORDINATE FRAMES note
   // above). All zero while no processed pipe exists yet, in which case every
   // *_display field is simply omitted rather than reported as a bogus 0.
+  // ALSO omitted (2026-07-31 investigation, see _mask_pipe_is_fresh's long
+  // note above backtransform_point_cb) when the pipe is individually >0 on
+  // every dimension but NOT fresh: a just-rebuilt piece list can leave a
+  // module's (e.g. crop's) piece->buf_in zeroed while processed_width still
+  // holds a stale-but-positive value from the previous generation, which
+  // would otherwise silently report a display frame missing that module's
+  // offset instead of a bogus one -- extending the same "omit rather than
+  // report wrong" philosophy from "unavailable" to "available but possibly
+  // stale".
   float wd = 0.0f, ht = 0.0f, iwidth = 0.0f, iheight = 0.0f;
   dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
+  const gboolean fresh = _mask_pipe_is_fresh(dev);
   const gboolean have_display =
-    (wd > 0.0f && ht > 0.0f && iwidth > 0.0f && iheight > 0.0f);
+    fresh && (wd > 0.0f && ht > 0.0f && iwidth > 0.0f && iheight > 0.0f);
+  if(!fresh) dt_dev_process_preview(dev); // nudge a refresh for a future call
   lua_pushboolean(L, have_display); lua_setfield(L, -2, "has_display_frame");
 
   lua_newtable(L);
