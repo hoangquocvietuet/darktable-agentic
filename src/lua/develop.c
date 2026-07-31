@@ -103,7 +103,21 @@
 // shape_type="unknown" for an ellipse without crashing, same as any other
 // pre-existing GUI-made non-circle shape). Purely additive at the wire
 // level. All API-8 fields kept.
-#define DT_LUA_DEVELOP_API 9
+// API 10 (2026-07-31, ellipse step 2/N): retouch_update_shape now accepts
+// an ellipse formid too (previously rejected as "not a circle shape"),
+// with new optional trailing radius_b/rotation args (rejected as an error,
+// not silently ignored, when passed for a circle -- refuse over silently-
+// wrong). Omitting them on an existing ellipse defaults to that shape's OWN
+// current radius_b/rotation (read from the live form before mutating it),
+// matching blur_radius/fill_mode's existing "move, not a reset" default
+// convention. retouch_list_shapes now reports full ellipse geometry
+// (target/radius/radius_b/rotation/feather plus their *_display
+// counterparts, the latter needing radius_b's OWN _mask_len_to_display
+// call since a non-uniform crop/aspect can transform an ellipse's two axes
+// to different display-frame lengths) instead of shape_type="unknown";
+// path/brush are still "unknown". Purely additive at the wire level. All
+// API-9 fields kept.
+#define DT_LUA_DEVELOP_API 10
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -3425,9 +3439,11 @@ static int retouch_add_shape_cb(lua_State *L)
 /* darktable.develop.retouch_update_shape(op, instance, formid, target_x,
  * target_y, radius, feather, source_x, source_y[, algorithm][, scale]
  * [, opacity][, blur_type][, blur_radius][, fill_mode][, fill_r][, fill_g]
- * [, fill_b][, fill_brightness])
+ * [, fill_b][, fill_brightness][, radius_b][, rotation])
  * ===========================================================================
- * Move/resize an EXISTING retouch circle shape IN PLACE (same formid) --
+ * Move/resize an EXISTING retouch circle OR ELLIPSE shape IN PLACE (same
+ * formid, same shape_type -- this cannot convert a circle to an ellipse or
+ * vice versa, only reposition/resize) --
  * unlike delete+retouch_add_shape, this does not reallocate a new form or
  * rt_forms[] slot, so a scripted "tune this point" edit doesn't churn
  * formids on every adjustment. Mirrors circle.c's own drag-commit path
@@ -3465,11 +3481,17 @@ static int retouch_add_shape_cb(lua_State *L)
  *                               (not the module-level widget mirror) --
  *                               omitting these on an existing blur/fill shape
  *                               is a pure geometry move, not a reset.
+ *   radius_b, rotation         only used when the shape is an ellipse
+ *                               (rejected as an error otherwise, see below);
+ *                               omit to keep the shape's current value --
+ *                               same "move, not a reset" default as blur/
+ *                               fill's fields above.
  *
  * Returns {ok=true, op, instance, formid, mask_id, algorithm, shape_type,
  * target={x,y}, radius, feather, opacity, wavelet_scale, source={x,y}
  * (heal/clone only), blur_type, blur_radius (blur only), fill_mode,
- * fill_color={r,g,b}, fill_brightness (fill only)} or {error=...}. */
+ * fill_color={r,g,b}, fill_brightness (fill only), radius_b, rotation
+ * (ellipse only)} or {error=...}. */
 static int retouch_update_shape_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3494,6 +3516,10 @@ static int retouch_update_shape_cb(lua_State *L)
   const double fill_b_arg = luaL_optnumber(L, 18, 0.0);
   const gboolean has_fill_brightness = !lua_isnoneornil(L, 19);
   const double fill_brightness_arg = luaL_optnumber(L, 19, 0.0);
+  const gboolean has_radius_b = !lua_isnoneornil(L, 20);
+  const double radius_b_arg = luaL_optnumber(L, 20, 0.0);
+  const gboolean has_rotation = !lua_isnoneornil(L, 21);
+  const double rotation_arg = luaL_optnumber(L, 21, 0.0);
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -3524,8 +3550,10 @@ static int retouch_update_shape_cb(lua_State *L)
   dt_masks_form_t *form = dt_masks_get_from_id(dev, formid);
   if(!form)
     return push_error(L, "retouch_update_shape: formid %d not found", (int)formid);
-  if(!(form->type & DT_MASKS_CIRCLE) || !form->points)
-    return push_error(L, "retouch_update_shape: formid %d is not a circle shape", (int)formid);
+  const gboolean is_ellipse = (form->type & DT_MASKS_ELLIPSE) != 0;
+  if((!(form->type & DT_MASKS_CIRCLE) && !is_ellipse) || !form->points)
+    return push_error(L, "retouch_update_shape: formid %d is not a circle or ellipse shape",
+                       (int)formid);
 
   int slot = -1;
   for(int i = 0; i < RETOUCH_NO_FORMS; i++)
@@ -3570,6 +3598,10 @@ static int retouch_update_shape_cb(lua_State *L)
   const double fill_brightness = has_fill_brightness
       ? CLAMPS(fill_brightness_arg, -1.0, 1.0) : (double)p->rt_forms[slot].fill_brightness;
 
+  if(!is_ellipse && (has_radius_b || has_rotation))
+    return push_error(L, "retouch_update_shape: radius_b/rotation only apply to an ellipse shape "
+                          "(formid %d is a circle)", (int)formid);
+
   const double target_x = CLAMPS(target_x_arg, 0.0, 1.0);
   const double target_y = CLAMPS(target_y_arg, 0.0, 1.0);
   const double source_x = CLAMPS(source_x_arg, 0.0, 1.0);
@@ -3580,13 +3612,31 @@ static int retouch_update_shape_cb(lua_State *L)
       ? p->rt_forms[slot].scale
       : (int)CLAMPS(scale_arg, 0, RETOUCH_MAX_SCALES + 1);
 
-  // geometry: direct mutation of the live form, same fields circle.c's
-  // button-released drag-commit writes.
-  dt_masks_point_circle_t *circle = (dt_masks_point_circle_t *)form->points->data;
-  circle->center[0] = (float)target_x;
-  circle->center[1] = (float)target_y;
-  circle->radius = (float)radius;
-  circle->border = (float)feather;
+  // geometry: direct mutation of the live form, same fields circle.c's/
+  // ellipse.c's own button-released drag-commit writes.
+  double radius_b = 0.0, rotation = 0.0;
+  if(is_ellipse)
+  {
+    dt_masks_point_ellipse_t *ellipse = (dt_masks_point_ellipse_t *)form->points->data;
+    // default to the shape's OWN current value (not `radius`/0) when
+    // omitted -- same "move, not a reset" convention as blur_radius etc.
+    radius_b = CLAMPS(has_radius_b ? radius_b_arg : (double)ellipse->radius[1], 0.0005, 0.5);
+    rotation = has_rotation ? rotation_arg : (double)ellipse->rotation;
+    ellipse->center[0] = (float)target_x;
+    ellipse->center[1] = (float)target_y;
+    ellipse->radius[0] = (float)radius;
+    ellipse->radius[1] = (float)radius_b;
+    ellipse->rotation = (float)rotation;
+    ellipse->border = (float)feather;
+  }
+  else
+  {
+    dt_masks_point_circle_t *circle = (dt_masks_point_circle_t *)form->points->data;
+    circle->center[0] = (float)target_x;
+    circle->center[1] = (float)target_y;
+    circle->radius = (float)radius;
+    circle->border = (float)feather;
+  }
   form->source[0] = needs_source ? (float)source_x : 0.0f;
   form->source[1] = needs_source ? (float)source_y : 0.0f;
 
@@ -3627,7 +3677,7 @@ static int retouch_update_shape_cb(lua_State *L)
   lua_pushinteger(L, (lua_Integer)module->blend_params->mask_id);
   lua_setfield(L, -2, "mask_id");
   lua_pushstring(L, rt_algo_to_string(algorithm)); lua_setfield(L, -2, "algorithm");
-  lua_pushstring(L, "circle");                     lua_setfield(L, -2, "shape_type");
+  lua_pushstring(L, is_ellipse ? "ellipse" : "circle"); lua_setfield(L, -2, "shape_type");
   lua_newtable(L);
   lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
   lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
@@ -3643,6 +3693,11 @@ static int retouch_update_shape_cb(lua_State *L)
   lua_pushnumber(L, feather);  lua_setfield(L, -2, "feather");
   lua_pushnumber(L, opacity);  lua_setfield(L, -2, "opacity");
   lua_pushinteger(L, scale);   lua_setfield(L, -2, "wavelet_scale");
+  if(is_ellipse)
+  {
+    lua_pushnumber(L, radius_b); lua_setfield(L, -2, "radius_b");
+    lua_pushnumber(L, rotation); lua_setfield(L, -2, "rotation");
+  }
   if(algorithm == DT_IOP_RETOUCH_BLUR)
   {
     lua_pushstring(L, rt_blur_type_to_string(blur_type)); lua_setfield(L, -2, "blur_type");
@@ -3757,8 +3812,11 @@ static int retouch_delete_shape_cb(lua_State *L)
  * merge_from_scale, shapes={{formid, algorithm, shape_type, target={x,y},
  * source={x,y} (heal/clone only), radius, feather, opacity, wavelet_scale,
  * blur_type, blur_radius (blur only), fill_mode, fill_color={r,g,b},
- * fill_brightness (fill only), target_display={x,y}, source_display={x,y},
- * radius_display, feather_display}, ...}} or {error=...}. */
+ * fill_brightness (fill only), radius_b, rotation (ellipse only),
+ * target_display={x,y}, source_display={x,y}, radius_display,
+ * radius_b_display (ellipse only), feather_display}, ...}} or {error=...}.
+ * shape_type is "unknown" (no geometry fields at all) for a pre-existing
+ * GUI-made path/brush shape -- not creatable via MCP yet. */
 static int retouch_list_shapes_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3891,10 +3949,60 @@ static int retouch_list_shapes_cb(lua_State *L)
           }
         }
       }
+      else if(form->type & DT_MASKS_ELLIPSE)
+      {
+        lua_pushstring(L, "ellipse"); lua_setfield(L, -2, "shape_type");
+        dt_masks_point_ellipse_t *ellipse =
+          form->points ? (dt_masks_point_ellipse_t *)form->points->data : NULL;
+        if(ellipse)
+        {
+          lua_newtable(L);
+          lua_pushnumber(L, ellipse->center[0]); lua_setfield(L, -2, "x");
+          lua_pushnumber(L, ellipse->center[1]); lua_setfield(L, -2, "y");
+          lua_setfield(L, -2, "target");
+          lua_pushnumber(L, ellipse->radius[0]); lua_setfield(L, -2, "radius");
+          lua_pushnumber(L, ellipse->radius[1]); lua_setfield(L, -2, "radius_b");
+          lua_pushnumber(L, ellipse->rotation);  lua_setfield(L, -2, "rotation");
+          lua_pushnumber(L, ellipse->border);    lua_setfield(L, -2, "feather");
+
+          double dx = 0.0, dy = 0.0, dlen = 0.0;
+          if(have_display
+             && _mask_point_to_display(dev, wd, ht, iwidth, iheight,
+                                       ellipse->center[0], ellipse->center[1], &dx, &dy))
+          {
+            lua_newtable(L);
+            lua_pushnumber(L, dx); lua_setfield(L, -2, "x");
+            lua_pushnumber(L, dy); lua_setfield(L, -2, "y");
+            lua_setfield(L, -2, "target_display");
+
+            // both semi-axes converted independently -- under a non-uniform
+            // crop/aspect change the two axes can transform to different
+            // display-frame lengths, unlike a circle's single radius.
+            if(_mask_len_to_display(dev, wd, ht, iwidth, iheight,
+                                    ellipse->center[0], ellipse->center[1],
+                                    ellipse->radius[0], &dlen))
+            {
+              lua_pushnumber(L, dlen); lua_setfield(L, -2, "radius_display");
+            }
+            if(_mask_len_to_display(dev, wd, ht, iwidth, iheight,
+                                    ellipse->center[0], ellipse->center[1],
+                                    ellipse->radius[1], &dlen))
+            {
+              lua_pushnumber(L, dlen); lua_setfield(L, -2, "radius_b_display");
+            }
+            if(_mask_len_to_display(dev, wd, ht, iwidth, iheight,
+                                    ellipse->center[0], ellipse->center[1],
+                                    ellipse->border, &dlen))
+            {
+              lua_pushnumber(L, dlen); lua_setfield(L, -2, "feather_display");
+            }
+          }
+        }
+      }
       else
       {
-        // pre-existing GUI-created ellipse/path/brush shape -- not creatable
-        // via MCP yet (Phase 2), but don't crash reading it back.
+        // pre-existing GUI-created path/brush shape -- not creatable via MCP
+        // yet, but don't crash reading it back.
         lua_pushstring(L, "unknown"); lua_setfield(L, -2, "shape_type");
       }
 
