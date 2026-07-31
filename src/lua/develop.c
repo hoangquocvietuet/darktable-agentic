@@ -117,7 +117,29 @@
 // to different display-frame lengths) instead of shape_type="unknown";
 // path/brush are still "unknown". Purely additive at the wire level. All
 // API-9 fields kept.
-#define DT_LUA_DEVELOP_API 10
+// API 11 (2026-07-31, ellipse+path step 3-5/N): retouch_add_shape/
+// retouch_update_shape gain shape_type="path" (create/replace-in-place),
+// with new optional trailing points (table of >=3 {x=,y=} nodes) and smooth
+// (bool) args -- add_path_mask_cb's own Catmull-Rom-bezier point-building
+// loop was extracted into a shared static helper (_build_path_points_from_
+// lua) rather than duplicated, used by both add_path_mask_cb and the two
+// retouch callbacks. For retouch_add_shape, target_x/y/radius are IGNORED
+// for a path (a polygon has no single center/radius) and `feather` switches
+// to add_path_mask's own bbox-FRACTION convention instead of circle/
+// ellipse's absolute-normalized one (same [0,0.5] clamp range regardless,
+// so the arg is reused rather than duplicated under a new name). For
+// retouch_update_shape, `points` is REQUIRED (not optional) when the target
+// shape is a path -- unlike every other field on this call, a path has no
+// "keep current, just move" option since its entire geometry IS the point
+// list; passing `points` for a non-path formid is a hard error, not
+// silently ignored. retouch_list_shapes reports full path geometry
+// (mask-frame corner/ctrl1/ctrl2/border/state per node) instead of
+// shape_type="unknown" -- deliberately WITHOUT per-point *_display fields
+// (a path can have dozens of nodes; N display-transform bridge calls per
+// list_shapes call is a real cost for a field the round-trip back into
+// update_shape's `points` arg doesn't need). brush is still "unknown".
+// Purely additive at the wire level. All API-10 fields kept.
+#define DT_LUA_DEVELOP_API 11
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -2880,6 +2902,121 @@ static int preview_cb(lua_State *L)
    with set_params/enable_module).
 
    Returns {ok=true, formid, mask_id, points=<n>, opacity, feather} or {error}. */
+
+// Shared by add_path_mask_cb and retouch_add_shape_cb/retouch_update_shape_cb
+// (2026-07-31 path shape_type batch): reads an N-point Lua array
+// {{x=,y=},...} at the given stack index into a GList of
+// dt_masks_point_path_t nodes (Catmull-Rom bezier handles if smooth, sharp
+// corners otherwise -- see the inline comments below for the exact formula,
+// matching darktable's own _path_catmull_to_bezier, masks/path.c), and
+// computes the bbox-fraction feather border (add_path_mask's own "feather is
+// a FRACTION of the mask bbox" convention). On success returns TRUE with
+// *points_out/*border_out set (caller owns the returned GList and its point
+// structs -- g_list_free_full(list, free) when done). On failure returns
+// FALSE with *errmsg_out set to a newly g_malloc'd message the caller must
+// g_free after handing to push_error (this helper never touches the Lua
+// stack's error path itself, so both callers can wrap it in their own
+// push_error(L, "%s", errmsg) with their own function-name prefix).
+static gboolean _build_path_points_from_lua(lua_State *L, int table_idx, int npoints,
+                                            gboolean smooth, double feather_frac,
+                                            GList **points_out, double *border_out,
+                                            char **errmsg_out)
+{
+  // First pass: read + clamp every node into a plain C array, and track the
+  // polygon's bounding box. We need all corners up front to (a) derive smooth
+  // Catmull-Rom bezier handles from each node's neighbors and (b) scale the
+  // feather to the mask's OWN size instead of a frame constant. On ANY
+  // malformed node, free and report a graceful error (never crash).
+  float *cx = g_malloc_n(npoints, sizeof(float));
+  float *cy = g_malloc_n(npoints, sizeof(float));
+  float minx = 1.0f, miny = 1.0f, maxx = 0.0f, maxy = 0.0f;
+  for(int i = 0; i < npoints; i++)
+  {
+    lua_rawgeti(L, table_idx, i + 1); // point table (1-based)
+    if(lua_type(L, -1) != LUA_TTABLE)
+    {
+      lua_pop(L, 1);
+      g_free(cx); g_free(cy);
+      *errmsg_out = g_strdup_printf("point %d is not a table {x=..,y=..}", i + 1);
+      return FALSE;
+    }
+    lua_getfield(L, -1, "x");
+    lua_getfield(L, -2, "y");
+    if(!lua_isnumber(L, -2) || !lua_isnumber(L, -1))
+    {
+      lua_pop(L, 3);
+      g_free(cx); g_free(cy);
+      *errmsg_out = g_strdup_printf("point %d has non-numeric x/y", i + 1);
+      return FALSE;
+    }
+    double x = lua_tonumber(L, -2);
+    double y = lua_tonumber(L, -1);
+    lua_pop(L, 3); // y, x, point table
+
+    if(x < 0.0) x = 0.0;
+    if(x > 1.0) x = 1.0;
+    if(y < 0.0) y = 0.0;
+    if(y > 1.0) y = 1.0;
+    cx[i] = (float)x;
+    cy[i] = (float)y;
+    if(cx[i] < minx) minx = cx[i];
+    if(cx[i] > maxx) maxx = cx[i];
+    if(cy[i] < miny) miny = cy[i];
+    if(cy[i] > maxy) maxy = cy[i];
+  }
+
+  // feather (soft edge) as a fraction of the mask's bbox max dimension, so a
+  // small subject gets a proportionally small edge instead of a frame-constant
+  // halo. Floored so a degenerate/near-zero bbox still yields a valid border.
+  const float bbox_dim = MAX(maxx - minx, maxy - miny);
+  const float border = MAX(0.0005f, (float)feather_frac * MAX(bbox_dim, 1e-4f));
+
+  GList *points = NULL;
+  for(int i = 0; i < npoints; i++)
+  {
+    dt_masks_point_path_t *bzpt = malloc(sizeof(dt_masks_point_path_t));
+    if(!bzpt)
+    {
+      g_list_free_full(points, free);
+      g_free(cx); g_free(cy);
+      *errmsg_out = g_strdup("out of memory building path node");
+      return FALSE;
+    }
+    bzpt->corner[0] = cx[i];
+    bzpt->corner[1] = cy[i];
+    if(smooth && npoints >= 3)
+    {
+      // Catmull-Rom -> cubic bezier control points, closed loop (indices wrap).
+      // Matches darktable's own _path_catmull_to_bezier (masks/path.c): incoming
+      // handle ctrl1 = (C[i-1] + 6*C[i] - C[i+1])/6, outgoing handle
+      // ctrl2 = (-C[i-1] + 6*C[i] + C[i+1])/6. Explicit handles + USER state keep
+      // the smooth shape stable through the blend/eval path (which does NOT
+      // resolve the -1 auto-sentinel), so no more faceted outline on curves.
+      const int pv = (i - 1 + npoints) % npoints;
+      const int nx = (i + 1) % npoints;
+      bzpt->ctrl1[0] = (cx[pv] + 6.0f * cx[i] - cx[nx]) / 6.0f;
+      bzpt->ctrl1[1] = (cy[pv] + 6.0f * cy[i] - cy[nx]) / 6.0f;
+      bzpt->ctrl2[0] = (-cx[pv] + 6.0f * cx[i] + cx[nx]) / 6.0f;
+      bzpt->ctrl2[1] = (-cy[pv] + 6.0f * cy[i] + cy[nx]) / 6.0f;
+    }
+    else
+    {
+      // sharp corner: ctrl == corner -> straight edges (legacy faceted shape).
+      bzpt->ctrl1[0] = bzpt->ctrl2[0] = cx[i];
+      bzpt->ctrl1[1] = bzpt->ctrl2[1] = cy[i];
+    }
+    bzpt->border[0] = bzpt->border[1] = border;
+    bzpt->state = DT_MASKS_POINT_STATE_USER;
+    points = g_list_append(points, bzpt);
+  }
+  g_free(cx);
+  g_free(cy);
+
+  *points_out = points;
+  *border_out = (double)border;
+  return TRUE;
+}
+
 static int add_path_mask_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -2914,99 +3051,24 @@ static int add_path_mask_cb(lua_State *L)
   if(feather < 0.0) feather = 0.0;
   if(feather > 0.5) feather = 0.5;
 
-  // First pass: read + clamp every node into a plain C array, and track the
-  // polygon's bounding box. We need all corners up front to (a) derive smooth
-  // Catmull-Rom bezier handles from each node's neighbors and (b) scale the
-  // feather to the mask's OWN size instead of a frame constant. On ANY
-  // malformed node, free and report a graceful error (never crash, #4).
-  float *cx = g_malloc_n(npoints, sizeof(float));
-  float *cy = g_malloc_n(npoints, sizeof(float));
-  float minx = 1.0f, miny = 1.0f, maxx = 0.0f, maxy = 0.0f;
-  for(int i = 0; i < npoints; i++)
+  GList *path_points = NULL;
+  double border = 0.0;
+  char *errmsg = NULL;
+  if(!_build_path_points_from_lua(L, 3, npoints, smooth, feather, &path_points, &border, &errmsg))
   {
-    lua_rawgeti(L, 3, i + 1); // point table (1-based)
-    if(lua_type(L, -1) != LUA_TTABLE)
-    {
-      lua_pop(L, 1);
-      g_free(cx); g_free(cy);
-      return push_error(L, "point %d is not a table {x=..,y=..}", i + 1);
-    }
-    lua_getfield(L, -1, "x");
-    lua_getfield(L, -2, "y");
-    if(!lua_isnumber(L, -2) || !lua_isnumber(L, -1))
-    {
-      lua_pop(L, 3);
-      g_free(cx); g_free(cy);
-      return push_error(L, "point %d has non-numeric x/y", i + 1);
-    }
-    double x = lua_tonumber(L, -2);
-    double y = lua_tonumber(L, -1);
-    lua_pop(L, 3); // y, x, point table
-
-    if(x < 0.0) x = 0.0;
-    if(x > 1.0) x = 1.0;
-    if(y < 0.0) y = 0.0;
-    if(y > 1.0) y = 1.0;
-    cx[i] = (float)x;
-    cy[i] = (float)y;
-    if(cx[i] < minx) minx = cx[i];
-    if(cx[i] > maxx) maxx = cx[i];
-    if(cy[i] < miny) miny = cy[i];
-    if(cy[i] > maxy) maxy = cy[i];
+    int ret = push_error(L, "%s", errmsg);
+    g_free(errmsg);
+    return ret;
   }
-
-  // feather (soft edge) as a fraction of the mask's bbox max dimension, so a
-  // small subject gets a proportionally small edge instead of a frame-constant
-  // halo. Floored so a degenerate/near-zero bbox still yields a valid border.
-  const float bbox_dim = MAX(maxx - minx, maxy - miny);
-  const float border = MAX(0.0005f, (float)feather * MAX(bbox_dim, 1e-4f));
 
   // Build the polygon form.
   dt_masks_form_t *form = dt_masks_create(DT_MASKS_PATH);
   if(!form)
   {
-    g_free(cx); g_free(cy);
+    g_list_free_full(path_points, free);
     return push_error(L, "dt_masks_create failed");
   }
-
-  for(int i = 0; i < npoints; i++)
-  {
-    dt_masks_point_path_t *bzpt = malloc(sizeof(dt_masks_point_path_t));
-    if(!bzpt)
-    {
-      dt_masks_free_form(form);
-      g_free(cx); g_free(cy);
-      return push_error(L, "out of memory building path node");
-    }
-    bzpt->corner[0] = cx[i];
-    bzpt->corner[1] = cy[i];
-    if(smooth && npoints >= 3)
-    {
-      // Catmull-Rom -> cubic bezier control points, closed loop (indices wrap).
-      // Matches darktable's own _path_catmull_to_bezier (masks/path.c): incoming
-      // handle ctrl1 = (C[i-1] + 6*C[i] - C[i+1])/6, outgoing handle
-      // ctrl2 = (-C[i-1] + 6*C[i] + C[i+1])/6. Explicit handles + USER state keep
-      // the smooth shape stable through the blend/eval path (which does NOT
-      // resolve the -1 auto-sentinel), so no more faceted outline on curves.
-      const int pv = (i - 1 + npoints) % npoints;
-      const int nx = (i + 1) % npoints;
-      bzpt->ctrl1[0] = (cx[pv] + 6.0f * cx[i] - cx[nx]) / 6.0f;
-      bzpt->ctrl1[1] = (cy[pv] + 6.0f * cy[i] - cy[nx]) / 6.0f;
-      bzpt->ctrl2[0] = (-cx[pv] + 6.0f * cx[i] + cx[nx]) / 6.0f;
-      bzpt->ctrl2[1] = (-cy[pv] + 6.0f * cy[i] + cy[nx]) / 6.0f;
-    }
-    else
-    {
-      // sharp corner: ctrl == corner -> straight edges (legacy faceted shape).
-      bzpt->ctrl1[0] = bzpt->ctrl2[0] = cx[i];
-      bzpt->ctrl1[1] = bzpt->ctrl2[1] = cy[i];
-    }
-    bzpt->border[0] = bzpt->border[1] = border;
-    bzpt->state = DT_MASKS_POINT_STATE_USER;
-    form->points = g_list_append(form->points, bzpt);
-  }
-  g_free(cx);
-  g_free(cy);
+  form->points = path_points;
 
   // WIRE: name form, append to dev->forms, create/extend the module's mask
   // group (sets blend_params->mask_id), add group point, masks-history items.
@@ -3134,10 +3196,10 @@ static const char *rt_fill_mode_to_string(dt_iop_retouch_fill_modes_t m)
 /* darktable.develop.retouch_add_shape(op, instance, algorithm, target_x,
  * target_y, radius, feather, source_x, source_y[, scale][, opacity]
  * [, blur_type][, blur_radius][, fill_mode][, fill_r][, fill_g][, fill_b]
- * [, fill_brightness])
+ * [, fill_brightness][, shape_type][, radius_b][, rotation][, points][, smooth])
  * ===========================================================================
- * Create a retouch shape (heal, clone, blur, or fill; circle or ellipse --
- * path/brush are a later phase, see docs/superpowers/specs/2026-07-31-
+ * Create a retouch shape (heal, clone, blur, or fill; circle, ellipse, or
+ * path -- brush is a later phase, see docs/superpowers/specs/2026-07-31-
  * retouch-ellipse-path-shapes-design.md) and bind it to a wavelet scale.
  * Runs on the GUI thread (dt_lua_gtk_wrap).
  *
@@ -3146,14 +3208,20 @@ static const char *rt_fill_mode_to_string(dt_iop_retouch_fill_modes_t m)
  *                  assumes the retouch params layout, unlike add_path_mask.
  *   algorithm      "heal", "clone", "blur", or "fill".
  *   target_x/y     shape center, normalized [0,1] image coords, clamped.
+ *                  IGNORED (any value accepted) for shape_type="path".
  *   radius/feather normalized, clamped to [0.0005, 0.5] / [0, 0.5]. For
  *                  shape_type="ellipse", `radius` is the FIRST semi-axis
  *                  (radius_a) and `feather` is the border -- same mindim-
  *                  normalized convention as circle's radius/border
  *                  (confirmed via ellipse.c's _points_to_transform: both
  *                  radius_a and radius_b scale by MIN(width,height), same
- *                  as circle's radius).
- *   shape_type     optional "circle" (default) or "ellipse".
+ *                  as circle's radius). For shape_type="path", `radius` is
+ *                  IGNORED and `feather` is instead a FRACTION of the
+ *                  path's own bounding box (add_path_mask's convention, NOT
+ *                  circle/ellipse's absolute-normalized one) -- same [0,0.5]
+ *                  clamp range either way, so this is a REUSED arg with a
+ *                  shape-dependent meaning, not a new one.
+ *   shape_type     optional "circle" (default), "ellipse", or "path".
  *   radius_b       ellipse's SECOND semi-axis, same normalization as
  *                  radius/radius_a; only used when shape_type="ellipse".
  *                  Defaults to `radius` (a circle-shaped ellipse) if
@@ -3161,6 +3229,14 @@ static const char *rt_fill_mode_to_string(dt_iop_retouch_fill_modes_t m)
  *                  explicitly.
  *   rotation       ellipse rotation in degrees; only used when
  *                  shape_type="ellipse". Default 0.
+ *   points         table of >=3 {x=,y=} nodes (each normalized [0,1],
+ *                  clamped); REQUIRED when shape_type="path", REJECTED
+ *                  (error, not silently ignored) otherwise. Same node
+ *                  format/validation as add_path_mask.
+ *   smooth         optional bool, only used when shape_type="path"; default
+ *                  true (Catmull-Rom bezier boundary). false = legacy
+ *                  faceted (straight-segment) polygon. Same as
+ *                  add_path_mask's own `smooth`.
  *   source_x/y     required for heal/clone (the point to sample from);
  *                  ignored (nil is fine) for blur/fill, which only ever
  *                  read/write the target area, never a separate source.
@@ -3194,10 +3270,12 @@ static const char *rt_fill_mode_to_string(dt_iop_retouch_fill_modes_t m)
  *                  algorithm=="fill". Default = params.fill_brightness.
  *
  * Returns {ok=true, op, instance, formid, mask_id, algorithm, shape_type,
- * target={x,y}, radius, feather, opacity, wavelet_scale, source={x,y}
- * (heal/clone only), blur_type, blur_radius (blur only), fill_mode,
- * fill_color={r,g,b}, fill_brightness (fill only), radius_b, rotation
- * (ellipse only)} or {error=...}. */
+ * target={x,y} (not for path), radius, feather, opacity, wavelet_scale,
+ * source={x,y} (heal/clone only), blur_type, blur_radius (blur only),
+ * fill_mode, fill_color={r,g,b}, fill_brightness (fill only), radius_b,
+ * rotation (ellipse only), points, smooth (path only -- points is the node
+ * COUNT, not the geometry; call retouch_list_shapes for the full point
+ * list)} or {error=...}. */
 static int retouch_add_shape_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3237,11 +3315,31 @@ static int retouch_add_shape_cb(lua_State *L)
   const gboolean has_radius_b = !lua_isnoneornil(L, 20);
   const double radius_b_arg = luaL_optnumber(L, 20, 0.0);
   const double rotation_arg = luaL_optnumber(L, 21, 0.0);
+  // points (table, only for shape_type="path") and smooth (bool, default
+  // true, same Catmull-Rom-or-corner choice add_path_mask exposes) are read
+  // via raw stack access below (not luaL_check*) since they're a table, not
+  // a scalar -- lua_isnoneornil is fine on any type.
+  const gboolean has_points = !lua_isnoneornil(L, 22);
+  const int smooth = lua_isnoneornil(L, 23) ? 1 : lua_toboolean(L, 23);
 
   const gboolean is_ellipse = !g_strcmp0(shape_type_str, "ellipse");
-  if(!is_ellipse && g_strcmp0(shape_type_str, "circle"))
+  const gboolean is_path = !g_strcmp0(shape_type_str, "path");
+  if(!is_ellipse && !is_path && g_strcmp0(shape_type_str, "circle"))
     return push_error(L, "retouch_add_shape: unsupported shape_type '%s' "
-                          "(must be 'circle' or 'ellipse')", shape_type_str);
+                          "(must be 'circle', 'ellipse', or 'path')", shape_type_str);
+  if(is_path && !has_points)
+    return push_error(L, "retouch_add_shape: points required for shape_type='path'");
+  if(!is_path && has_points)
+    return push_error(L, "retouch_add_shape: points only applies to shape_type='path'");
+  int path_npoints = 0;
+  if(is_path)
+  {
+    if(!lua_istable(L, 22))
+      return push_error(L, "retouch_add_shape: points must be a table");
+    path_npoints = (int)lua_rawlen(L, 22);
+    if(path_npoints < 3)
+      return push_error(L, "retouch_add_shape: path needs at least 3 points (got %d)", path_npoints);
+  }
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -3292,18 +3390,50 @@ static int retouch_add_shape_cb(lua_State *L)
   const double opacity = CLAMPS(opacity_arg, 0.0, 1.0);
   const int scale = (scale_arg < 0) ? p->curr_scale : (int)CLAMPS(scale_arg, 0, RETOUCH_MAX_SCALES + 1);
 
+  // path's point list is read/validated BEFORE dt_masks_create so a
+  // malformed point never leaves an orphan form behind.
+  GList *path_points = NULL;
+  double path_border = 0.0;
+  double path_feather_frac = feather; // path's own bbox-fraction convention
+                                       // (add_path_mask_cb's), NOT circle/
+                                       // ellipse's absolute-normalized
+                                       // feather -- same [0,0.5] clamp range
+                                       // either way, so `feather` is reused
+                                       // as-is rather than adding a
+                                       // duplicate arg with a different name.
+  if(is_path)
+  {
+    char *errmsg = NULL;
+    if(!_build_path_points_from_lua(L, 22, path_npoints, smooth, path_feather_frac,
+                                    &path_points, &path_border, &errmsg))
+    {
+      int ret = push_error(L, "retouch_add_shape: %s", errmsg);
+      g_free(errmsg);
+      return ret;
+    }
+  }
+
   // DT_MASKS_CLONE unconditionally, same as the existing (shipped, confirmed
   // working) circle path -- blur/fill's rt_process_forms branch keys off
   // p->rt_forms[index].algorithm, never off this masks-subsystem type bit
   // (see retouch_list_shapes_cb's algorithm-based, not type-based, `source`
   // gate below), so there is no proven benefit to matching the GUI's own
   // CLONE/NON_CLONE choice here and real risk in changing already-working
-  // behavior for an unrelated (ellipse) change.
-  dt_masks_form_t *form = dt_masks_create((is_ellipse ? DT_MASKS_ELLIPSE : DT_MASKS_CIRCLE) | DT_MASKS_CLONE);
+  // behavior for an unrelated (ellipse/path) change.
+  const dt_masks_type_t base_type =
+    is_path ? DT_MASKS_PATH : (is_ellipse ? DT_MASKS_ELLIPSE : DT_MASKS_CIRCLE);
+  dt_masks_form_t *form = dt_masks_create(base_type | DT_MASKS_CLONE);
   if(!form)
+  {
+    if(path_points) g_list_free_full(path_points, free);
     return push_error(L, "dt_masks_create failed");
+  }
 
-  if(is_ellipse)
+  if(is_path)
+  {
+    form->points = path_points;
+  }
+  else if(is_ellipse)
   {
     dt_masks_point_ellipse_t *ellipse = malloc(sizeof(dt_masks_point_ellipse_t));
     if(!ellipse)
@@ -3397,11 +3527,15 @@ static int retouch_add_shape_cb(lua_State *L)
   lua_pushinteger(L, (lua_Integer)formid);         lua_setfield(L, -2, "formid");
   lua_pushinteger(L, (lua_Integer)mask_id);        lua_setfield(L, -2, "mask_id");
   lua_pushstring(L, rt_algo_to_string(algorithm)); lua_setfield(L, -2, "algorithm");
-  lua_pushstring(L, is_ellipse ? "ellipse" : "circle"); lua_setfield(L, -2, "shape_type");
-  lua_newtable(L);
-  lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
-  lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
-  lua_setfield(L, -2, "target");
+  lua_pushstring(L, is_path ? "path" : (is_ellipse ? "ellipse" : "circle"));
+  lua_setfield(L, -2, "shape_type");
+  if(!is_path)
+  {
+    lua_newtable(L);
+    lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
+    lua_setfield(L, -2, "target");
+  }
   if(needs_source)
   {
     lua_newtable(L);
@@ -3409,8 +3543,17 @@ static int retouch_add_shape_cb(lua_State *L)
     lua_pushnumber(L, source_y); lua_setfield(L, -2, "y");
     lua_setfield(L, -2, "source");
   }
-  lua_pushnumber(L, radius);   lua_setfield(L, -2, "radius");
-  lua_pushnumber(L, feather);  lua_setfield(L, -2, "feather");
+  if(is_path)
+  {
+    lua_pushinteger(L, path_npoints); lua_setfield(L, -2, "points");
+    lua_pushnumber(L, path_border);   lua_setfield(L, -2, "feather");
+    lua_pushboolean(L, smooth);       lua_setfield(L, -2, "smooth");
+  }
+  else
+  {
+    lua_pushnumber(L, radius);  lua_setfield(L, -2, "radius");
+    lua_pushnumber(L, feather); lua_setfield(L, -2, "feather");
+  }
   lua_pushnumber(L, opacity);  lua_setfield(L, -2, "opacity");
   lua_pushinteger(L, scale);   lua_setfield(L, -2, "wavelet_scale");
   if(is_ellipse)
@@ -3439,11 +3582,11 @@ static int retouch_add_shape_cb(lua_State *L)
 /* darktable.develop.retouch_update_shape(op, instance, formid, target_x,
  * target_y, radius, feather, source_x, source_y[, algorithm][, scale]
  * [, opacity][, blur_type][, blur_radius][, fill_mode][, fill_r][, fill_g]
- * [, fill_b][, fill_brightness][, radius_b][, rotation])
+ * [, fill_b][, fill_brightness][, radius_b][, rotation][, points][, smooth])
  * ===========================================================================
- * Move/resize an EXISTING retouch circle OR ELLIPSE shape IN PLACE (same
- * formid, same shape_type -- this cannot convert a circle to an ellipse or
- * vice versa, only reposition/resize) --
+ * Move/resize an EXISTING retouch circle, ellipse, OR PATH shape IN PLACE
+ * (same formid, same shape_type -- this cannot convert a shape from one
+ * type to another, only reposition/resize/reshape within its own type) --
  * unlike delete+retouch_add_shape, this does not reallocate a new form or
  * rt_forms[] slot, so a scripted "tune this point" edit doesn't churn
  * formids on every adjustment. Mirrors circle.c's own drag-commit path
@@ -3461,7 +3604,8 @@ static int retouch_add_shape_cb(lua_State *L)
  *                               member of this module instance's mask group.
  *   target_x/y, radius, feather same semantics/clamping as retouch_add_shape.
  *                               Always resent in full -- this is a "move",
- *                               not a partial field patch.
+ *                               not a partial field patch. IGNORED (any
+ *                               value accepted) when the shape is a path.
  *   source_x/y                 required if the EFFECTIVE algorithm (the new
  *                               one below, or the shape's current one if
  *                               omitted) is heal/clone; ignored (nil is fine)
@@ -3486,12 +3630,25 @@ static int retouch_add_shape_cb(lua_State *L)
  *                               omit to keep the shape's current value --
  *                               same "move, not a reset" default as blur/
  *                               fill's fields above.
+ *   points                     REQUIRED when the shape is a path (a path's
+ *                               geometry IS its point list -- there is no
+ *                               separate target/radius to move
+ *                               independently, so unlike every other field
+ *                               here there is no "keep current" option);
+ *                               REJECTED (error) for any other shape type.
+ *                               Same {x=,y=} node format/validation as
+ *                               retouch_add_shape. REPLACES the entire
+ *                               point list, not a partial patch.
+ *   smooth                     optional bool, only used together with
+ *                               `points`; default true. Same as
+ *                               retouch_add_shape's `smooth`.
  *
  * Returns {ok=true, op, instance, formid, mask_id, algorithm, shape_type,
- * target={x,y}, radius, feather, opacity, wavelet_scale, source={x,y}
- * (heal/clone only), blur_type, blur_radius (blur only), fill_mode,
- * fill_color={r,g,b}, fill_brightness (fill only), radius_b, rotation
- * (ellipse only)} or {error=...}. */
+ * target={x,y} (not for path), radius, feather, opacity, wavelet_scale,
+ * source={x,y} (heal/clone only), blur_type, blur_radius (blur only),
+ * fill_mode, fill_color={r,g,b}, fill_brightness (fill only), radius_b,
+ * rotation (ellipse only), points, smooth (path only -- points is the node
+ * COUNT, not the geometry)} or {error=...}. */
 static int retouch_update_shape_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3520,6 +3677,8 @@ static int retouch_update_shape_cb(lua_State *L)
   const double radius_b_arg = luaL_optnumber(L, 20, 0.0);
   const gboolean has_rotation = !lua_isnoneornil(L, 21);
   const double rotation_arg = luaL_optnumber(L, 21, 0.0);
+  const gboolean has_points = !lua_isnoneornil(L, 22);
+  const int smooth = lua_isnoneornil(L, 23) ? 1 : lua_toboolean(L, 23);
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -3551,9 +3710,26 @@ static int retouch_update_shape_cb(lua_State *L)
   if(!form)
     return push_error(L, "retouch_update_shape: formid %d not found", (int)formid);
   const gboolean is_ellipse = (form->type & DT_MASKS_ELLIPSE) != 0;
-  if((!(form->type & DT_MASKS_CIRCLE) && !is_ellipse) || !form->points)
-    return push_error(L, "retouch_update_shape: formid %d is not a circle or ellipse shape",
+  const gboolean is_path = (form->type & DT_MASKS_PATH) != 0;
+  if((!(form->type & DT_MASKS_CIRCLE) && !is_ellipse && !is_path) || !form->points)
+    return push_error(L, "retouch_update_shape: formid %d is not a circle, ellipse, or path shape",
                        (int)formid);
+  if(is_path && !has_points)
+    return push_error(L, "retouch_update_shape: points required to update a path shape "
+                          "(a path's geometry IS its point list -- there is no separate "
+                          "target/radius to move independently)");
+  if(!is_path && has_points)
+    return push_error(L, "retouch_update_shape: points only applies to updating a path shape "
+                          "(formid %d is not a path)", (int)formid);
+  int path_npoints = 0;
+  if(is_path)
+  {
+    if(!lua_istable(L, 22))
+      return push_error(L, "retouch_update_shape: points must be a table");
+    path_npoints = (int)lua_rawlen(L, 22);
+    if(path_npoints < 3)
+      return push_error(L, "retouch_update_shape: path needs at least 3 points (got %d)", path_npoints);
+  }
 
   int slot = -1;
   for(int i = 0; i < RETOUCH_NO_FORMS; i++)
@@ -3600,7 +3776,7 @@ static int retouch_update_shape_cb(lua_State *L)
 
   if(!is_ellipse && (has_radius_b || has_rotation))
     return push_error(L, "retouch_update_shape: radius_b/rotation only apply to an ellipse shape "
-                          "(formid %d is a circle)", (int)formid);
+                          "(formid %d is %s)", (int)formid, is_path ? "a path" : "a circle");
 
   const double target_x = CLAMPS(target_x_arg, 0.0, 1.0);
   const double target_y = CLAMPS(target_y_arg, 0.0, 1.0);
@@ -3612,10 +3788,33 @@ static int retouch_update_shape_cb(lua_State *L)
       ? p->rt_forms[slot].scale
       : (int)CLAMPS(scale_arg, 0, RETOUCH_MAX_SCALES + 1);
 
+  // path's new point list is read/validated BEFORE mutating the live form so
+  // a malformed point never leaves the shape half-replaced.
+  GList *path_points = NULL;
+  double path_border = 0.0;
+  if(is_path)
+  {
+    char *errmsg = NULL;
+    if(!_build_path_points_from_lua(L, 22, path_npoints, smooth, feather,
+                                    &path_points, &path_border, &errmsg))
+    {
+      int ret = push_error(L, "retouch_update_shape: %s", errmsg);
+      g_free(errmsg);
+      return ret;
+    }
+  }
+
   // geometry: direct mutation of the live form, same fields circle.c's/
-  // ellipse.c's own button-released drag-commit writes.
+  // ellipse.c's own button-released drag-commit writes. Path REPLACES the
+  // entire point list (its geometry IS the point list, unlike circle/
+  // ellipse's independently-movable center) -- free the old GList first.
   double radius_b = 0.0, rotation = 0.0;
-  if(is_ellipse)
+  if(is_path)
+  {
+    g_list_free_full(form->points, free);
+    form->points = path_points;
+  }
+  else if(is_ellipse)
   {
     dt_masks_point_ellipse_t *ellipse = (dt_masks_point_ellipse_t *)form->points->data;
     // default to the shape's OWN current value (not `radius`/0) when
@@ -3677,11 +3876,15 @@ static int retouch_update_shape_cb(lua_State *L)
   lua_pushinteger(L, (lua_Integer)module->blend_params->mask_id);
   lua_setfield(L, -2, "mask_id");
   lua_pushstring(L, rt_algo_to_string(algorithm)); lua_setfield(L, -2, "algorithm");
-  lua_pushstring(L, is_ellipse ? "ellipse" : "circle"); lua_setfield(L, -2, "shape_type");
-  lua_newtable(L);
-  lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
-  lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
-  lua_setfield(L, -2, "target");
+  lua_pushstring(L, is_path ? "path" : (is_ellipse ? "ellipse" : "circle"));
+  lua_setfield(L, -2, "shape_type");
+  if(!is_path)
+  {
+    lua_newtable(L);
+    lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
+    lua_setfield(L, -2, "target");
+  }
   if(needs_source)
   {
     lua_newtable(L);
@@ -3689,8 +3892,17 @@ static int retouch_update_shape_cb(lua_State *L)
     lua_pushnumber(L, source_y); lua_setfield(L, -2, "y");
     lua_setfield(L, -2, "source");
   }
-  lua_pushnumber(L, radius);   lua_setfield(L, -2, "radius");
-  lua_pushnumber(L, feather);  lua_setfield(L, -2, "feather");
+  if(is_path)
+  {
+    lua_pushinteger(L, path_npoints); lua_setfield(L, -2, "points");
+    lua_pushnumber(L, path_border);   lua_setfield(L, -2, "feather");
+    lua_pushboolean(L, smooth);       lua_setfield(L, -2, "smooth");
+  }
+  else
+  {
+    lua_pushnumber(L, radius);  lua_setfield(L, -2, "radius");
+    lua_pushnumber(L, feather); lua_setfield(L, -2, "feather");
+  }
   lua_pushnumber(L, opacity);  lua_setfield(L, -2, "opacity");
   lua_pushinteger(L, scale);   lua_setfield(L, -2, "wavelet_scale");
   if(is_ellipse)
@@ -3809,14 +4021,17 @@ static int retouch_delete_shape_cb(lua_State *L)
  * module's blend opacity.
  *
  * Returns {module="retouch", instance, num_scales, curr_scale,
- * merge_from_scale, shapes={{formid, algorithm, shape_type, target={x,y},
- * source={x,y} (heal/clone only), radius, feather, opacity, wavelet_scale,
- * blur_type, blur_radius (blur only), fill_mode, fill_color={r,g,b},
- * fill_brightness (fill only), radius_b, rotation (ellipse only),
- * target_display={x,y}, source_display={x,y}, radius_display,
- * radius_b_display (ellipse only), feather_display}, ...}} or {error=...}.
- * shape_type is "unknown" (no geometry fields at all) for a pre-existing
- * GUI-made path/brush shape -- not creatable via MCP yet. */
+ * merge_from_scale, shapes={{formid, algorithm, shape_type, target={x,y}
+ * (not for path), source={x,y} (heal/clone only), radius, feather, opacity,
+ * wavelet_scale, blur_type, blur_radius (blur only), fill_mode,
+ * fill_color={r,g,b}, fill_brightness (fill only), radius_b, rotation
+ * (ellipse only), points={{corner={x,y},ctrl1={x,y},ctrl2={x,y},border,
+ * state},...} (path only -- MASK-FRAME ONLY, no per-point *_display; see
+ * inline comment above), target_display={x,y}, source_display={x,y},
+ * radius_display, radius_b_display (ellipse only), feather_display},
+ * ...}} or {error=...}. shape_type is "unknown" (no geometry fields at
+ * all) for a pre-existing GUI-made brush shape -- not creatable via MCP
+ * yet. */
 static int retouch_list_shapes_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3999,10 +4214,46 @@ static int retouch_list_shapes_cb(lua_State *L)
           }
         }
       }
+      else if(form->type & DT_MASKS_PATH)
+      {
+        lua_pushstring(L, "path"); lua_setfield(L, -2, "shape_type");
+        // Mask-frame point geometry only (corner/ctrl1/ctrl2/border/state
+        // per node, same fields get_mask reports) -- NOT per-point
+        // *_display, unlike circle/ellipse's single-point target_display.
+        // A path can have dozens of nodes; N display-transform bridge calls
+        // per retouch_list_shapes call would be a real cost for a field
+        // most callers don't need (the mask-frame points already round-trip
+        // exactly back into retouch_add_shape/update_shape's `points` arg,
+        // which is what a move/resize actually needs).
+        int pidx = 1;
+        lua_newtable(L);
+        for(GList *pl = form->points; pl; pl = g_list_next(pl))
+        {
+          dt_masks_point_path_t *node = (dt_masks_point_path_t *)pl->data;
+          if(!node) continue;
+          lua_newtable(L);
+          lua_newtable(L);
+          lua_pushnumber(L, node->corner[0]); lua_setfield(L, -2, "x");
+          lua_pushnumber(L, node->corner[1]); lua_setfield(L, -2, "y");
+          lua_setfield(L, -2, "corner");
+          lua_newtable(L);
+          lua_pushnumber(L, node->ctrl1[0]); lua_setfield(L, -2, "x");
+          lua_pushnumber(L, node->ctrl1[1]); lua_setfield(L, -2, "y");
+          lua_setfield(L, -2, "ctrl1");
+          lua_newtable(L);
+          lua_pushnumber(L, node->ctrl2[0]); lua_setfield(L, -2, "x");
+          lua_pushnumber(L, node->ctrl2[1]); lua_setfield(L, -2, "y");
+          lua_setfield(L, -2, "ctrl2");
+          lua_pushnumber(L, node->border[0]); lua_setfield(L, -2, "border");
+          lua_pushinteger(L, (lua_Integer)node->state); lua_setfield(L, -2, "state");
+          lua_rawseti(L, -2, pidx++);
+        }
+        lua_setfield(L, -2, "points");
+      }
       else
       {
-        // pre-existing GUI-created path/brush shape -- not creatable via MCP
-        // yet, but don't crash reading it back.
+        // pre-existing GUI-created brush shape -- not creatable via MCP yet,
+        // but don't crash reading it back.
         lua_pushstring(L, "unknown"); lua_setfield(L, -2, "shape_type");
       }
 
