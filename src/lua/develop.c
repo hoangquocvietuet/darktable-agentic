@@ -3629,6 +3629,46 @@ static int get_mask_cb(lua_State *L)
   return 1;
 }
 
+/* darktable.develop.rename_mask(mask_id, name)
+   Give a drawn mask a caller-chosen name instead of the auto-generated
+   "path #7"/"circle #3" -- bugreport 2026-07-31: an agent creating many
+   masks across a session (e.g. several mask_object/add_path_mask calls on
+   one image) has no way to tell them apart afterward except by formid,
+   which hurts orientation. Mirrors the masks-manager panel's own rename
+   text-entry callback EXACTLY (src/libs/masks.c's _tree_name_edited,
+   g_strlcpy + dt_dev_add_masks_history_item(dev, NULL, FALSE) -- module
+   NULL resolves internally to the mask_manager module, same as the GUI's
+   own headless-safe path).
+
+   Empty name is coerced to a single space (same guard as the GUI): an
+   empty form->name serializes into the XMP sidecar as a bare "<rdf:li/>"
+   element, which is a known-bad edge case the GUI already works around
+   this same way, not something new introduced here.
+
+   Returns {ok, mask_id, name} with `name` read back from the live struct
+   (not the requested string) -- same verify-after-write discipline as
+   attach_mask's mask_mode readback, so a caller never has to trust a
+   write silently. Mutates dev->forms, commits history -> GUI thread. */
+static int rename_mask_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  const dt_mask_id_t id = (dt_mask_id_t)luaL_checkinteger(L, 1);
+  const char *name = luaL_checkstring(L, 2);
+  if(!dev) return push_error(L, "no darkroom image loaded");
+  dt_masks_form_t *f = dt_masks_get_from_id(dev, id);
+  if(!f) return push_error(L, "mask %d not found in darkroom forms", id);
+
+  const char *safe_name = (name[0] == '\0') ? " " : name;
+  g_strlcpy(f->name, safe_name, sizeof(f->name));
+  dt_dev_add_masks_history_item(dev, NULL, FALSE);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);       lua_setfield(L, -2, "ok");
+  lua_pushinteger(L, f->formid);  lua_setfield(L, -2, "mask_id");
+  lua_pushstring(L, f->name);     lua_setfield(L, -2, "name");
+  return 1;
+}
+
 int dt_lua_init_develop(lua_State *L)
 {
   dt_lua_push_darktable_lib(L);
@@ -3800,6 +3840,14 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "get_mask");
+
+  // rename_mask(mask_id, name): give a drawn mask a caller-chosen name
+  // (2026-07-31 bugreport -- orientation among many masks). Mutates
+  // dev->forms, commits history -> GUI thread.
+  lua_pushcfunction(L, rename_mask_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "rename_mask");
 
   // list_all_masks(): read-only enumeration of EVERY drawn shape in the
   // current image (dev->forms), independent of which module uses it, plus
