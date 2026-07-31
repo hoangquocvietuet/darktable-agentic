@@ -71,7 +71,23 @@
 // frame-constant, so a small/thin subject no longer "glows"/bleeds. Purely
 // additive at the wire level; the feather semantic change is documented on the
 // tool. All API-6 fields kept.
-#define DT_LUA_DEVELOP_API 7
+// API 8 (2026-07-31 bugreport #5): retouch_add_shape/retouch_update_shape now
+// accept algorithm "blur"/"fill" (previously only "heal"/"clone"), each with
+// new optional trailing args (blur_type, blur_radius, fill_mode, fill_r/g/b,
+// fill_brightness) that write the corresponding rt_forms[] fields, defaulting
+// from the module's current widget-mirror params (mirrors retouch.c's
+// rt_resynch_params' copy-on-create step, which is static/GUI-only and
+// unreachable from here). source_x/source_y are now optional -- required
+// only when the EFFECTIVE algorithm is heal/clone; blur/fill have no source
+// at all. retouch_list_shapes reports blur_type/blur_radius or fill_mode/
+// fill_color/fill_brightness per shape, and now gates `source`/
+// `source_display` on the shape's ALGORITHM instead of form->type's CLONE/
+// NON_CLONE bit (that bit is always CLONE for every circle this binding
+// creates, regardless of algorithm, so it never actually distinguished
+// heal/clone from blur/fill). Purely additive at the wire level: every
+// existing positional argument keeps its meaning and position; old callers
+// passing only heal/clone are unaffected. All API-7 fields kept.
+#define DT_LUA_DEVELOP_API 8
 #define DT_LUA_DEVELOP_MIN_BRIDGE 1
 
 /* darktable.develop.version()
@@ -3037,8 +3053,10 @@ static int add_path_mask_cb(lua_State *L)
 static gboolean rt_algo_from_string(const char *s, dt_iop_retouch_algo_type_t *out)
 {
   if(!s) return FALSE;
-  if(!g_strcmp0(s, "heal")) { *out = DT_IOP_RETOUCH_HEAL; return TRUE; }
+  if(!g_strcmp0(s, "heal"))  { *out = DT_IOP_RETOUCH_HEAL;  return TRUE; }
   if(!g_strcmp0(s, "clone")) { *out = DT_IOP_RETOUCH_CLONE; return TRUE; }
+  if(!g_strcmp0(s, "blur"))  { *out = DT_IOP_RETOUCH_BLUR;  return TRUE; }
+  if(!g_strcmp0(s, "fill"))  { *out = DT_IOP_RETOUCH_FILL;  return TRUE; }
   return FALSE;
 }
 
@@ -3054,27 +3072,86 @@ static const char *rt_algo_to_string(dt_iop_retouch_algo_type_t a)
   }
 }
 
+// blur/fill per-shape sub-params (dt_iop_retouch_form_data_t's blur_type/
+// fill_mode, iop/retouch.h) -- same string<->enum convention as the
+// algorithm itself.
+static gboolean rt_blur_type_from_string(const char *s, dt_iop_retouch_blur_types_t *out)
+{
+  if(!s) return FALSE;
+  if(!g_strcmp0(s, "gaussian"))  { *out = DT_IOP_RETOUCH_BLUR_GAUSSIAN;  return TRUE; }
+  if(!g_strcmp0(s, "bilateral")) { *out = DT_IOP_RETOUCH_BLUR_BILATERAL; return TRUE; }
+  return FALSE;
+}
+
+static const char *rt_blur_type_to_string(dt_iop_retouch_blur_types_t t)
+{
+  return (t == DT_IOP_RETOUCH_BLUR_BILATERAL) ? "bilateral" : "gaussian";
+}
+
+static gboolean rt_fill_mode_from_string(const char *s, dt_iop_retouch_fill_modes_t *out)
+{
+  if(!s) return FALSE;
+  if(!g_strcmp0(s, "erase")) { *out = DT_IOP_RETOUCH_FILL_ERASE; return TRUE; }
+  if(!g_strcmp0(s, "color")) { *out = DT_IOP_RETOUCH_FILL_COLOR; return TRUE; }
+  return FALSE;
+}
+
+static const char *rt_fill_mode_to_string(dt_iop_retouch_fill_modes_t m)
+{
+  return (m == DT_IOP_RETOUCH_FILL_COLOR) ? "color" : "erase";
+}
+
 /* darktable.develop.retouch_add_shape(op, instance, algorithm, target_x,
- * target_y, radius, feather, source_x, source_y[, scale][, opacity])
+ * target_y, radius, feather, source_x, source_y[, scale][, opacity]
+ * [, blur_type][, blur_radius][, fill_mode][, fill_r][, fill_g][, fill_b]
+ * [, fill_brightness])
  * ===========================================================================
- * Create a CIRCLE retouch shape (heal or clone; only shape/algorithms
- * supported in this build -- see the module doc comment above) and bind it
- * to a wavelet scale. Runs on the GUI thread (dt_lua_gtk_wrap).
+ * Create a CIRCLE retouch shape (heal, clone, blur, or fill -- circle is the
+ * only SHAPE supported in this build; ellipse/path/brush are a later phase)
+ * and bind it to a wavelet scale. Runs on the GUI thread (dt_lua_gtk_wrap).
  *
  * ARGS
  *   op, instance   must resolve to the "retouch" module -- this binding
  *                  assumes the retouch params layout, unlike add_path_mask.
- *   algorithm      "heal" or "clone".
+ *   algorithm      "heal", "clone", "blur", or "fill".
  *   target_x/y     shape center, normalized [0,1] image coords, clamped.
  *   radius/feather normalized, clamped to [0.0005, 0.5] / [0, 0.5].
- *   source_x/y     required (heal/clone always need a source point).
+ *   source_x/y     required for heal/clone (the point to sample from);
+ *                  ignored (nil is fine) for blur/fill, which only ever
+ *                  read/write the target area, never a separate source.
  *   scale          optional wavelet scale, 0..RETOUCH_MAX_SCALES+1 (residual
- *                  slot); default = the module's current curr_scale.
+ *                  slot); default = the module's current curr_scale. Scale 0
+ *                  is the base/full-resolution image, where blur/fill affect
+ *                  BOTH fine texture and underlying tone -- wavelet
+ *                  decomposition (dwt_decompose, iop/retouch.c) separates an
+ *                  image into per-scale detail layers plus a residual tone
+ *                  layer, so blurring at a NONZERO scale (e.g. wrinkles,
+ *                  pores) softens only that scale's texture and leaves tone/
+ *                  shadow on the other scales untouched. This is why "heal"
+ *                  at scale 0 can visibly flatten/brighten a shadow it was
+ *                  never meant to touch: heal/clone always operate on the
+ *                  full pixel value (tone included), regardless of scale.
  *   opacity        optional 0..1, default 1.0.
+ *   blur_type      optional "gaussian"/"bilateral"; used only when
+ *                  algorithm=="blur". Default = the module's current
+ *                  blur_type widget value (params.blur_type) -- mirrors what
+ *                  retouch.c's rt_resynch_params does when the GUI creates a
+ *                  new blur shape (that function is static/GUI-only,
+ *                  unreachable from here, so this replicates its copy step).
+ *   blur_radius    optional, clamped to [0.1, 200.0]; used only when
+ *                  algorithm=="blur". Default = params.blur_radius.
+ *   fill_mode      optional "erase"/"color"; used only when
+ *                  algorithm=="fill". Default = params.fill_mode.
+ *   fill_r/g/b     optional, each clamped to [0,1]; used only when
+ *                  algorithm=="fill" and fill_mode=="color". Default =
+ *                  params.fill_color.
+ *   fill_brightness optional, clamped to [-1.0, 1.0]; used only when
+ *                  algorithm=="fill". Default = params.fill_brightness.
  *
  * Returns {ok=true, op, instance, formid, mask_id, algorithm, shape_type,
- * target={x,y}, source={x,y}, radius, feather, opacity, wavelet_scale} or
- * {error=...}. */
+ * target={x,y}, radius, feather, opacity, wavelet_scale, source={x,y}
+ * (heal/clone only), blur_type, blur_radius (blur only), fill_mode,
+ * fill_color={r,g,b}, fill_brightness (fill only)} or {error=...}. */
 static int retouch_add_shape_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3084,17 +3161,32 @@ static int retouch_add_shape_cb(lua_State *L)
   const double target_y_arg = luaL_checknumber(L, 5);
   const double radius_arg = luaL_checknumber(L, 6);
   const double feather_arg = luaL_checknumber(L, 7);
-  if(lua_isnoneornil(L, 8) || lua_isnoneornil(L, 9))
-    return push_error(L, "retouch_add_shape: source_x/source_y required for heal/clone");
-  const double source_x_arg = luaL_checknumber(L, 8);
-  const double source_y_arg = luaL_checknumber(L, 9);
-  const int scale_arg = luaL_optinteger(L, 10, -1); // -1 => default to curr_scale
-  const double opacity_arg = luaL_optnumber(L, 11, 1.0);
 
   dt_iop_retouch_algo_type_t algorithm;
   if(!rt_algo_from_string(algo_str, &algorithm))
     return push_error(L, "retouch_add_shape: unsupported algorithm '%s' "
-                          "(only 'heal'/'clone' in this build)", algo_str);
+                          "(must be 'heal', 'clone', 'blur', or 'fill')", algo_str);
+
+  const gboolean needs_source =
+    (algorithm == DT_IOP_RETOUCH_HEAL || algorithm == DT_IOP_RETOUCH_CLONE);
+  if(needs_source && (lua_isnoneornil(L, 8) || lua_isnoneornil(L, 9)))
+    return push_error(L, "retouch_add_shape: source_x/source_y required for heal/clone");
+  const double source_x_arg = luaL_optnumber(L, 8, 0.0);
+  const double source_y_arg = luaL_optnumber(L, 9, 0.0);
+
+  const int scale_arg = luaL_optinteger(L, 10, -1); // -1 => default to curr_scale
+  const double opacity_arg = luaL_optnumber(L, 11, 1.0);
+  const char *blur_type_str = lua_isnoneornil(L, 12) ? NULL : luaL_checkstring(L, 12);
+  const gboolean has_blur_radius = !lua_isnoneornil(L, 13);
+  const double blur_radius_arg = luaL_optnumber(L, 13, 0.0);
+  const char *fill_mode_str = lua_isnoneornil(L, 14) ? NULL : luaL_checkstring(L, 14);
+  const gboolean has_fill_color =
+    !lua_isnoneornil(L, 15) || !lua_isnoneornil(L, 16) || !lua_isnoneornil(L, 17);
+  const double fill_r_arg = luaL_optnumber(L, 15, 0.0);
+  const double fill_g_arg = luaL_optnumber(L, 16, 0.0);
+  const double fill_b_arg = luaL_optnumber(L, 17, 0.0);
+  const gboolean has_fill_brightness = !lua_isnoneornil(L, 18);
+  const double fill_brightness_arg = luaL_optnumber(L, 18, 0.0);
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -3107,6 +3199,23 @@ static int retouch_add_shape_cb(lua_State *L)
     return push_error(L, "retouch_add_shape: module '%s' is not the retouch module", op);
 
   dt_iop_retouch_params_t *p = (dt_iop_retouch_params_t *)module->params;
+
+  dt_iop_retouch_blur_types_t blur_type = p->blur_type;
+  if(blur_type_str && !rt_blur_type_from_string(blur_type_str, &blur_type))
+    return push_error(L, "retouch_add_shape: unsupported blur_type '%s' "
+                          "(must be 'gaussian' or 'bilateral')", blur_type_str);
+  const double blur_radius = has_blur_radius
+      ? CLAMPS(blur_radius_arg, 0.1, 200.0) : (double)p->blur_radius;
+
+  dt_iop_retouch_fill_modes_t fill_mode = p->fill_mode;
+  if(fill_mode_str && !rt_fill_mode_from_string(fill_mode_str, &fill_mode))
+    return push_error(L, "retouch_add_shape: unsupported fill_mode '%s' "
+                          "(must be 'erase' or 'color')", fill_mode_str);
+  const double fill_r = has_fill_color ? CLAMPS(fill_r_arg, 0.0, 1.0) : (double)p->fill_color[0];
+  const double fill_g = has_fill_color ? CLAMPS(fill_g_arg, 0.0, 1.0) : (double)p->fill_color[1];
+  const double fill_b = has_fill_color ? CLAMPS(fill_b_arg, 0.0, 1.0) : (double)p->fill_color[2];
+  const double fill_brightness = has_fill_brightness
+      ? CLAMPS(fill_brightness_arg, -1.0, 1.0) : (double)p->fill_brightness;
 
   // find a free rt_forms[] slot (mirrors retouch.c's static rt_allow_create_form cap check).
   int slot = -1;
@@ -3142,8 +3251,8 @@ static int retouch_add_shape_cb(lua_State *L)
   circle->border = (float)feather;
   form->points = g_list_append(form->points, circle);
 
-  form->source[0] = (float)source_x;
-  form->source[1] = (float)source_y;
+  form->source[0] = needs_source ? (float)source_x : 0.0f;
+  form->source[1] = needs_source ? (float)source_y : 0.0f;
   form->source[2] = 0.0f;
 
   // WIRE: name form, append to dev->forms, create/extend the module's mask
@@ -3177,6 +3286,19 @@ static int retouch_add_shape_cb(lua_State *L)
   p->rt_forms[slot].scale = scale;
   p->rt_forms[slot].algorithm = algorithm;
   p->rt_forms[slot].distort_mode = 2;
+  if(algorithm == DT_IOP_RETOUCH_BLUR)
+  {
+    p->rt_forms[slot].blur_type = blur_type;
+    p->rt_forms[slot].blur_radius = (float)blur_radius;
+  }
+  else if(algorithm == DT_IOP_RETOUCH_FILL)
+  {
+    p->rt_forms[slot].fill_mode = fill_mode;
+    p->rt_forms[slot].fill_color[0] = (float)fill_r;
+    p->rt_forms[slot].fill_color[1] = (float)fill_g;
+    p->rt_forms[slot].fill_color[2] = (float)fill_b;
+    p->rt_forms[slot].fill_brightness = (float)fill_brightness;
+  }
 
   // commit params + live reprocess (invalidates the pipe so the next
   // preview() reflects the new shape).
@@ -3196,19 +3318,39 @@ static int retouch_add_shape_cb(lua_State *L)
   lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
   lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
   lua_setfield(L, -2, "target");
-  lua_newtable(L);
-  lua_pushnumber(L, source_x); lua_setfield(L, -2, "x");
-  lua_pushnumber(L, source_y); lua_setfield(L, -2, "y");
-  lua_setfield(L, -2, "source");
+  if(needs_source)
+  {
+    lua_newtable(L);
+    lua_pushnumber(L, source_x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, source_y); lua_setfield(L, -2, "y");
+    lua_setfield(L, -2, "source");
+  }
   lua_pushnumber(L, radius);   lua_setfield(L, -2, "radius");
   lua_pushnumber(L, feather);  lua_setfield(L, -2, "feather");
   lua_pushnumber(L, opacity);  lua_setfield(L, -2, "opacity");
   lua_pushinteger(L, scale);   lua_setfield(L, -2, "wavelet_scale");
+  if(algorithm == DT_IOP_RETOUCH_BLUR)
+  {
+    lua_pushstring(L, rt_blur_type_to_string(blur_type)); lua_setfield(L, -2, "blur_type");
+    lua_pushnumber(L, blur_radius);                       lua_setfield(L, -2, "blur_radius");
+  }
+  else if(algorithm == DT_IOP_RETOUCH_FILL)
+  {
+    lua_pushstring(L, rt_fill_mode_to_string(fill_mode)); lua_setfield(L, -2, "fill_mode");
+    lua_newtable(L);
+    lua_pushnumber(L, fill_r); lua_setfield(L, -2, "r");
+    lua_pushnumber(L, fill_g); lua_setfield(L, -2, "g");
+    lua_pushnumber(L, fill_b); lua_setfield(L, -2, "b");
+    lua_setfield(L, -2, "fill_color");
+    lua_pushnumber(L, fill_brightness); lua_setfield(L, -2, "fill_brightness");
+  }
   return 1;
 }
 
 /* darktable.develop.retouch_update_shape(op, instance, formid, target_x,
- * target_y, radius, feather, source_x, source_y[, algorithm][, scale][, opacity])
+ * target_y, radius, feather, source_x, source_y[, algorithm][, scale]
+ * [, opacity][, blur_type][, blur_radius][, fill_mode][, fill_r][, fill_g]
+ * [, fill_b][, fill_brightness])
  * ===========================================================================
  * Move/resize an EXISTING retouch circle shape IN PLACE (same formid) --
  * unlike delete+retouch_add_shape, this does not reallocate a new form or
@@ -3217,29 +3359,42 @@ static int retouch_add_shape_cb(lua_State *L)
  * (_circle_events_button_released): geometry commits via
  * dt_dev_add_masks_history_item (masks-history), NOT dt_dev_add_history_item
  * (iop-params-history) -- the latter is only needed for rt_forms[]'s
- * algorithm/scale, which live in module->params, not in the mask geometry.
- * No dt_dev_distort_backtransform is needed (unlike the GUI drag path) since
- * we already write normalized image coords directly, not on-screen pixels.
- * Runs on the GUI thread (dt_lua_gtk_wrap).
+ * algorithm/scale/blur/fill fields, which live in module->params, not in the
+ * mask geometry. No dt_dev_distort_backtransform is needed (unlike the GUI
+ * drag path) since we already write normalized image coords directly, not
+ * on-screen pixels. Runs on the GUI thread (dt_lua_gtk_wrap).
  *
  * ARGS
  *   formid                     existing shape id (from retouch_add_shape or
  *                               retouch_list_shapes); must already be a
  *                               member of this module instance's mask group.
- *   target_x/y, radius, feather,
- *   source_x/y                 same semantics/clamping as retouch_add_shape.
+ *   target_x/y, radius, feather same semantics/clamping as retouch_add_shape.
  *                               Always resent in full -- this is a "move",
  *                               not a partial field patch.
- *   algorithm                   optional "heal"/"clone"; omit/nil to keep
- *                               the shape's current algorithm.
+ *   source_x/y                 required if the EFFECTIVE algorithm (the new
+ *                               one below, or the shape's current one if
+ *                               omitted) is heal/clone; ignored (nil is fine)
+ *                               for blur/fill.
+ *   algorithm                   optional "heal"/"clone"/"blur"/"fill";
+ *                               omit/nil to keep the shape's current
+ *                               algorithm.
  *   scale                       optional wavelet scale; omit or negative to
  *                               keep the shape's current scale.
  *   opacity                     optional 0..1; omit/nil to leave the mask
  *                               group's opacity untouched.
+ *   blur_type, blur_radius,
+ *   fill_mode, fill_r/g/b,
+ *   fill_brightness            optional, same semantics/clamping/defaulting
+ *                               as retouch_add_shape, except the default
+ *                               when omitted is this SHAPE's current value
+ *                               (not the module-level widget mirror) --
+ *                               omitting these on an existing blur/fill shape
+ *                               is a pure geometry move, not a reset.
  *
  * Returns {ok=true, op, instance, formid, mask_id, algorithm, shape_type,
- * target={x,y}, source={x,y}, radius, feather, opacity, wavelet_scale} or
- * {error=...}. */
+ * target={x,y}, radius, feather, opacity, wavelet_scale, source={x,y}
+ * (heal/clone only), blur_type, blur_radius (blur only), fill_mode,
+ * fill_color={r,g,b}, fill_brightness (fill only)} or {error=...}. */
 static int retouch_update_shape_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3249,14 +3404,21 @@ static int retouch_update_shape_cb(lua_State *L)
   const double target_y_arg = luaL_checknumber(L, 5);
   const double radius_arg = luaL_checknumber(L, 6);
   const double feather_arg = luaL_checknumber(L, 7);
-  if(lua_isnoneornil(L, 8) || lua_isnoneornil(L, 9))
-    return push_error(L, "retouch_update_shape: source_x/source_y required");
-  const double source_x_arg = luaL_checknumber(L, 8);
-  const double source_y_arg = luaL_checknumber(L, 9);
   const char *algo_str = lua_isnoneornil(L, 10) ? NULL : luaL_checkstring(L, 10);
   const int scale_arg = luaL_optinteger(L, 11, -1);
   const gboolean has_opacity = !lua_isnoneornil(L, 12);
   const double opacity_arg = luaL_optnumber(L, 12, 1.0);
+  const char *blur_type_str = lua_isnoneornil(L, 13) ? NULL : luaL_checkstring(L, 13);
+  const gboolean has_blur_radius = !lua_isnoneornil(L, 14);
+  const double blur_radius_arg = luaL_optnumber(L, 14, 0.0);
+  const char *fill_mode_str = lua_isnoneornil(L, 15) ? NULL : luaL_checkstring(L, 15);
+  const gboolean has_fill_color =
+    !lua_isnoneornil(L, 16) || !lua_isnoneornil(L, 17) || !lua_isnoneornil(L, 18);
+  const double fill_r_arg = luaL_optnumber(L, 16, 0.0);
+  const double fill_g_arg = luaL_optnumber(L, 17, 0.0);
+  const double fill_b_arg = luaL_optnumber(L, 18, 0.0);
+  const gboolean has_fill_brightness = !lua_isnoneornil(L, 19);
+  const double fill_brightness_arg = luaL_optnumber(L, 19, 0.0);
 
   dt_develop_t *dev = darktable.develop;
   if(!dev || !dev->iop)
@@ -3298,10 +3460,40 @@ static int retouch_update_shape_cb(lua_State *L)
   if(slot < 0)
     return push_error(L, "retouch_update_shape: formid %d has no rt_forms[] entry", (int)formid);
 
+  // resolve the EFFECTIVE algorithm before validating source_x/y -- must
+  // know whether we're heal/clone (source required) or blur/fill (source
+  // irrelevant) before enforcing that requirement.
   dt_iop_retouch_algo_type_t algorithm = p->rt_forms[slot].algorithm;
   if(algo_str && !rt_algo_from_string(algo_str, &algorithm))
     return push_error(L, "retouch_update_shape: unsupported algorithm '%s' "
-                          "(only 'heal'/'clone' in this build)", algo_str);
+                          "(must be 'heal', 'clone', 'blur', or 'fill')", algo_str);
+
+  const gboolean needs_source =
+    (algorithm == DT_IOP_RETOUCH_HEAL || algorithm == DT_IOP_RETOUCH_CLONE);
+  if(needs_source && (lua_isnoneornil(L, 8) || lua_isnoneornil(L, 9)))
+    return push_error(L, "retouch_update_shape: source_x/source_y required for heal/clone");
+  const double source_x_arg = luaL_optnumber(L, 8, 0.0);
+  const double source_y_arg = luaL_optnumber(L, 9, 0.0);
+
+  dt_iop_retouch_blur_types_t blur_type = p->rt_forms[slot].blur_type;
+  if(blur_type_str && !rt_blur_type_from_string(blur_type_str, &blur_type))
+    return push_error(L, "retouch_update_shape: unsupported blur_type '%s' "
+                          "(must be 'gaussian' or 'bilateral')", blur_type_str);
+  const double blur_radius = has_blur_radius
+      ? CLAMPS(blur_radius_arg, 0.1, 200.0) : (double)p->rt_forms[slot].blur_radius;
+
+  dt_iop_retouch_fill_modes_t fill_mode = p->rt_forms[slot].fill_mode;
+  if(fill_mode_str && !rt_fill_mode_from_string(fill_mode_str, &fill_mode))
+    return push_error(L, "retouch_update_shape: unsupported fill_mode '%s' "
+                          "(must be 'erase' or 'color')", fill_mode_str);
+  const double fill_r = has_fill_color
+      ? CLAMPS(fill_r_arg, 0.0, 1.0) : (double)p->rt_forms[slot].fill_color[0];
+  const double fill_g = has_fill_color
+      ? CLAMPS(fill_g_arg, 0.0, 1.0) : (double)p->rt_forms[slot].fill_color[1];
+  const double fill_b = has_fill_color
+      ? CLAMPS(fill_b_arg, 0.0, 1.0) : (double)p->rt_forms[slot].fill_color[2];
+  const double fill_brightness = has_fill_brightness
+      ? CLAMPS(fill_brightness_arg, -1.0, 1.0) : (double)p->rt_forms[slot].fill_brightness;
 
   const double target_x = CLAMPS(target_x_arg, 0.0, 1.0);
   const double target_y = CLAMPS(target_y_arg, 0.0, 1.0);
@@ -3320,8 +3512,8 @@ static int retouch_update_shape_cb(lua_State *L)
   circle->center[1] = (float)target_y;
   circle->radius = (float)radius;
   circle->border = (float)feather;
-  form->source[0] = (float)source_x;
-  form->source[1] = (float)source_y;
+  form->source[0] = needs_source ? (float)source_x : 0.0f;
+  form->source[1] = needs_source ? (float)source_y : 0.0f;
 
   double opacity = member->opacity;
   if(has_opacity)
@@ -3335,6 +3527,19 @@ static int retouch_update_shape_cb(lua_State *L)
   // retouch_add_shape_cb for why this must not depend on rt_resynch_params.
   p->rt_forms[slot].algorithm = algorithm;
   p->rt_forms[slot].scale = scale;
+  if(algorithm == DT_IOP_RETOUCH_BLUR)
+  {
+    p->rt_forms[slot].blur_type = blur_type;
+    p->rt_forms[slot].blur_radius = (float)blur_radius;
+  }
+  else if(algorithm == DT_IOP_RETOUCH_FILL)
+  {
+    p->rt_forms[slot].fill_mode = fill_mode;
+    p->rt_forms[slot].fill_color[0] = (float)fill_r;
+    p->rt_forms[slot].fill_color[1] = (float)fill_g;
+    p->rt_forms[slot].fill_color[2] = (float)fill_b;
+    p->rt_forms[slot].fill_brightness = (float)fill_brightness;
+  }
   dt_dev_add_history_item(dev, module, module->enabled);
 
   if(module->expander) dt_iop_gui_update(module);
@@ -3352,14 +3557,32 @@ static int retouch_update_shape_cb(lua_State *L)
   lua_pushnumber(L, target_x); lua_setfield(L, -2, "x");
   lua_pushnumber(L, target_y); lua_setfield(L, -2, "y");
   lua_setfield(L, -2, "target");
-  lua_newtable(L);
-  lua_pushnumber(L, source_x); lua_setfield(L, -2, "x");
-  lua_pushnumber(L, source_y); lua_setfield(L, -2, "y");
-  lua_setfield(L, -2, "source");
+  if(needs_source)
+  {
+    lua_newtable(L);
+    lua_pushnumber(L, source_x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, source_y); lua_setfield(L, -2, "y");
+    lua_setfield(L, -2, "source");
+  }
   lua_pushnumber(L, radius);   lua_setfield(L, -2, "radius");
   lua_pushnumber(L, feather);  lua_setfield(L, -2, "feather");
   lua_pushnumber(L, opacity);  lua_setfield(L, -2, "opacity");
   lua_pushinteger(L, scale);   lua_setfield(L, -2, "wavelet_scale");
+  if(algorithm == DT_IOP_RETOUCH_BLUR)
+  {
+    lua_pushstring(L, rt_blur_type_to_string(blur_type)); lua_setfield(L, -2, "blur_type");
+    lua_pushnumber(L, blur_radius);                       lua_setfield(L, -2, "blur_radius");
+  }
+  else if(algorithm == DT_IOP_RETOUCH_FILL)
+  {
+    lua_pushstring(L, rt_fill_mode_to_string(fill_mode)); lua_setfield(L, -2, "fill_mode");
+    lua_newtable(L);
+    lua_pushnumber(L, fill_r); lua_setfield(L, -2, "r");
+    lua_pushnumber(L, fill_g); lua_setfield(L, -2, "g");
+    lua_pushnumber(L, fill_b); lua_setfield(L, -2, "b");
+    lua_setfield(L, -2, "fill_color");
+    lua_pushnumber(L, fill_brightness); lua_setfield(L, -2, "fill_brightness");
+  }
   return 1;
 }
 
@@ -3458,8 +3681,9 @@ static int retouch_delete_shape_cb(lua_State *L)
  * Returns {module="retouch", instance, num_scales, curr_scale,
  * merge_from_scale, shapes={{formid, algorithm, shape_type, target={x,y},
  * source={x,y} (heal/clone only), radius, feather, opacity, wavelet_scale,
- * target_display={x,y}, source_display={x,y}, radius_display,
- * feather_display}, ...}} or {error=...}. */
+ * blur_type, blur_radius (blur only), fill_mode, fill_color={r,g,b},
+ * fill_brightness (fill only), target_display={x,y}, source_display={x,y},
+ * radius_display, feather_display}, ...}} or {error=...}. */
 static int retouch_list_shapes_cb(lua_State *L)
 {
   const char *op = luaL_checkstring(L, 1);
@@ -3533,6 +3757,26 @@ static int retouch_list_shapes_cb(lua_State *L)
       lua_pushinteger(L, p->rt_forms[rt_index].scale); lua_setfield(L, -2, "wavelet_scale");
       lua_pushnumber(L, gp->opacity); lua_setfield(L, -2, "opacity");
 
+      if(p->rt_forms[rt_index].algorithm == DT_IOP_RETOUCH_BLUR)
+      {
+        lua_pushstring(L, rt_blur_type_to_string(p->rt_forms[rt_index].blur_type));
+        lua_setfield(L, -2, "blur_type");
+        lua_pushnumber(L, p->rt_forms[rt_index].blur_radius);
+        lua_setfield(L, -2, "blur_radius");
+      }
+      else if(p->rt_forms[rt_index].algorithm == DT_IOP_RETOUCH_FILL)
+      {
+        lua_pushstring(L, rt_fill_mode_to_string(p->rt_forms[rt_index].fill_mode));
+        lua_setfield(L, -2, "fill_mode");
+        lua_newtable(L);
+        lua_pushnumber(L, p->rt_forms[rt_index].fill_color[0]); lua_setfield(L, -2, "r");
+        lua_pushnumber(L, p->rt_forms[rt_index].fill_color[1]); lua_setfield(L, -2, "g");
+        lua_pushnumber(L, p->rt_forms[rt_index].fill_color[2]); lua_setfield(L, -2, "b");
+        lua_setfield(L, -2, "fill_color");
+        lua_pushnumber(L, p->rt_forms[rt_index].fill_brightness);
+        lua_setfield(L, -2, "fill_brightness");
+      }
+
       if(form->type & DT_MASKS_CIRCLE)
       {
         lua_pushstring(L, "circle"); lua_setfield(L, -2, "shape_type");
@@ -3579,7 +3823,13 @@ static int retouch_list_shapes_cb(lua_State *L)
         lua_pushstring(L, "unknown"); lua_setfield(L, -2, "shape_type");
       }
 
-      if(form->type & (DT_MASKS_CLONE | DT_MASKS_NON_CLONE))
+      // gate on the retouch ALGORITHM, not form->type's CLONE/NON_CLONE bit --
+      // retouch_add_shape_cb always creates DT_MASKS_CLONE-flavored circles
+      // regardless of algorithm (that flag is a dt_masks subsystem concept,
+      // unrelated to retouch's own heal/clone/blur/fill choice), so form->
+      // source would otherwise report a meaningless {0,0,0} for blur/fill.
+      if(p->rt_forms[rt_index].algorithm == DT_IOP_RETOUCH_HEAL
+         || p->rt_forms[rt_index].algorithm == DT_IOP_RETOUCH_CLONE)
       {
         lua_newtable(L);
         lua_pushnumber(L, form->source[0]); lua_setfield(L, -2, "x");
