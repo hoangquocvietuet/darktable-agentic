@@ -3669,6 +3669,37 @@ static int rename_mask_cb(lua_State *L)
   return 1;
 }
 
+/* darktable.develop.delete_mask(mask_id)
+   Permanently delete a drawn mask shape, regardless of whether it is
+   currently attached to any module's blend group (bugreport 2026-07-31:
+   no way to clean up an orphan/unwanted mask left over from calibration/
+   experimentation -- detach_mask only unwires it, still leaving it in
+   dev->forms forever). Thin wrapper around dt_masks_form_remove(NULL,
+   NULL, form) with grp=NULL -- the exact "permanently delete this form"
+   code path masks.c's own detach_mask cascade ALREADY exercises when a
+   group's last shape is detached (masks.c:1901 onward: sweeps every
+   module referencing the shape, clears mask_id where it was the base
+   group, commits history per affected module) -- reused as-is, module=
+   NULL is fine since that branch never dereferences its module argument
+   for a form-wide delete (only the earlier "detach from THIS ONE group"
+   branch does, which grp=NULL skips entirely). Returns {ok, mask_id} --
+   errors if the mask_id doesn't exist (nothing silently no-oped). */
+static int delete_mask_cb(lua_State *L)
+{
+  dt_develop_t *dev = darktable.develop;
+  const dt_mask_id_t id = (dt_mask_id_t)luaL_checkinteger(L, 1);
+  if(!dev) return push_error(L, "no darkroom image loaded");
+  dt_masks_form_t *f = dt_masks_get_from_id(dev, id);
+  if(!f) return push_error(L, "mask %d not found in darkroom forms", id);
+
+  dt_masks_form_remove(NULL, NULL, f);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE);  lua_setfield(L, -2, "ok");
+  lua_pushinteger(L, id);    lua_setfield(L, -2, "mask_id");
+  return 1;
+}
+
 int dt_lua_init_develop(lua_State *L)
 {
   dt_lua_push_darktable_lib(L);
@@ -3848,6 +3879,14 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "rename_mask");
+
+  // delete_mask(mask_id): permanently delete a drawn mask shape (2026-07-31
+  // bugreport -- no way to clean up an orphan mask). Mutates dev->forms,
+  // commits history per affected module -> GUI thread.
+  lua_pushcfunction(L, delete_mask_cb);
+  dt_lua_gtk_wrap(L);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "delete_mask");
 
   // list_all_masks(): read-only enumeration of EVERY drawn shape in the
   // current image (dev->forms), independent of which module uses it, plus
