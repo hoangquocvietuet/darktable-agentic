@@ -1402,6 +1402,17 @@ static void _push_viewport(lua_State *L, dt_dev_viewport_t *port)
   // region: TOP-LEFT, clamped [0,1] -- drop-in for get_preview's `region`.
   int procw = 0, proch = 0;
   dt_dev_get_processed_size(port, &procw, &proch);
+
+  // processed_width/processed_height (ADDED for set_viewport, see develop.c):
+  // the EXACT, UNCLAMPED denominator the region math above divides by. A
+  // caller inverting the region formula (set_viewport: region -> zoom_x/
+  // zoom_y/scale) needs these directly -- back-deriving them from the
+  // (possibly clamped, when boxw/boxh > 1 i.e. zoomed out past fit) `region.w`/
+  // `region.h` above would silently misfire in that clamped case. Plain
+  // additive fields, no existing reader breaks.
+  lua_pushinteger(L, procw); lua_setfield(L, -2, "processed_width");
+  lua_pushinteger(L, proch); lua_setfield(L, -2, "processed_height");
+
   if(procw > 0 && proch > 0 && scale > 0.0f)
   {
     // fraction of the full image visible per axis (dt_dev_get_zoom_bounds math)
@@ -1890,32 +1901,529 @@ static void _run_on_gui_sync(void (*fn)(void *), void *data)
   g_cond_clear(&g.c);
 }
 
-/* GUI-thread snapshot + conditional (re)trigger of the preview worker. */
+/* ==========================================================================
+   darktable.develop.set_viewport(viewport, zoom_x, zoom_y, scale
+                                   [, wait_for_pipe][, timeout_ms])
+   darktable.develop.restore_viewport(viewport, zoom, closeup, zoom_x, zoom_y,
+                                       scale[, wait_for_pipe][, timeout_ms])
+   ==========================================================================
+   Writable counterpart to get_viewport() (2026-07-31 "set-viewport-design"
+   task). An agent states an ABSOLUTE zoom_x/zoom_y/scale -- the exact fields
+   get_viewport() reads back (center-relative pan, dt_dev_get_zoom_scale-
+   equivalent scale). This binding does NOT do region math (aspect-expand,
+   mode translation, min_render_px_across): that is darktable_mcp/server.py's
+   job, which reads processed_width/processed_height (added to
+   _push_viewport above specifically for this) plus the current region/
+   scale from get_viewport() to invert the region formula documented above
+   _push_viewport, then calls this binding with the resulting zoom_x/zoom_y/
+   scale. Division of labor mirrors viewport_coords.py's affine transforms:
+   C provides exact primitives, Python does policy.
+
+   WRITE PRIMITIVE (read in full, not just its first ~40 lines, per the task
+   note) -- dt_dev_zoom_move(port, zoom, scale, closeup, x, y, constrain),
+   develop.c:3187:
+     * DT_ZOOM_POSITION sets zoom_x=x; zoom_y=y directly (absolute, center-
+       relative) and returns BEFORE the big else-chain that writes port->
+       zoom/closeup/zoom_scale -- those three fields are left untouched by a
+       POSITION call.
+     * Every OTHER zoom value that ever actually gets STORED into port->zoom
+       (only DT_ZOOM_FIT/FILL/DT_ZOOM_1/FREE survive to that assignment;
+       SCROLL/MOVE/FULL_PREVIEW/RESTORE are transient operation-selectors
+       that remap internally before the assignment) sets port->closeup/
+       zoom_scale/zoom unconditionally at the bottom of the else-chain, from
+       whatever `scale`/`closeup` were passed -- AS LONG AS `closeup` is not
+       DT_ZOOM_1's sentinel -1/-2 (interactive-toggle triggers; never used
+       here, we always pass a concrete closeup).
+     * x<0 (we pass -1.0f) on the zoom-mode call skips the cursor-relative
+       "zoom under the mouse" adjustment entirely, leaving pan untouched --
+       the following POSITION call sets it explicitly regardless.
+     * A POSITION call passed pan-space (small, often positive) x/y values
+       ALSO reaches that same cursor-adjustment code path (it is gated only
+       on x,y>=0, not on the zoom type) but it is a verified no-op there:
+       cur_scale and new_scale are both computed from port->zoom/closeup,
+       which a pure POSITION call never modifies, so cur_scale==new_scale
+       and the adjustment term (mouse_off*(1/cur_scale - 1/new_scale)) is
+       algebraically zero.
+   Net effect: setting scale+position from one intent takes exactly TWO
+   calls -- (1) a zoom-mode call (DT_ZOOM_FREE for set_viewport per
+   requirement 5; the ORIGINAL previous.zoom for restore_viewport, to
+   reproduce the exact zoom_label) with x=y=-1, then (2) a DT_ZOOM_POSITION
+   call with the target zoom_x/zoom_y. This mirrors the live GUI itself: a
+   scroll-wheel zoom and a drag-pan are already two separate, non-atomic
+   dt_dev_zoom_move calls from two different GTK signal handlers -- there is
+   no existing atomic set-both primitive to fall back to instead.
+
+   SCALE CLAMP (requirement 6) -- darktable's own unconstrained free-zoom
+   bound (_zoom_constraint_bounds(constrained=FALSE, ...), develop.c:2892,
+   static/non-exported -- reproduced here, rather than exporting it, to keep
+   the diff to this file's own new code): regardless of image-size category,
+   the UNCONSTRAINED bounds always collapse to the same
+   [tscalefloor, tscaletop] = [MIN(0.5*fitscale*ppd, 1.0), 16.0] (tscale
+   units, i.e. already ppd-multiplied) -- divide by ppd for plain `scale`.
+   This is the exact bound darktable's own pinch-zoom uses unconstrained;
+   free zoom (requirement 5) is that same unconstrained mode.
+
+   WAIT-FOR-PIPE (requirement 3) watches the PORT'S OWN pipe (dev->full.pipe
+   / dev->preview2.pipe), NOT dev->preview_pipe: confirmed those are
+   different dt_dev_pixelpipe_t instances -- dt_dev_process_preview_job_run
+   (control/jobs/develop_jobs.c) processes dev->preview_pipe with port=NULL,
+   entirely independent of any dt_dev_viewport_t's zoom state; only
+   dt_dev_process_image_job_run passes port=&dev->full. Freshness signal is
+   DELIBERATELY NOT preview()'s timestamp check (status==VALID &&
+   input_timestamp>=want_ts): a pure zoom/pan change does NOT bump
+   dev->timestamp (only dt_dev_invalidate/invalidate_all do, for content/
+   history edits -- develop.c:304-320), so a pipe already VALID from BEFORE
+   this call would satisfy that check immediately even though it has not
+   re-rendered at the new zoom at all. Instead this polls the port->pipe->
+   changed DT_DEV_PIPE_ZOOMED bit, which dt_dev_zoom_move sets synchronously
+   (develop.c:3388) and which dt_dev_process_image_job only clears once it
+   has re-run dt_dev_pixelpipe_process at the CURRENT (new) zoom/scale/
+   position (develop.c:788,837-858) -- an accurate, zoom-specific freshness
+   signal, not a content-edit one. The worker run is triggered the same way
+   preview() triggers dev->preview_pipe's: dt_dev_process_image(dev) /
+   dt_dev_process_preview2(dev), both queuing to a WORKER thread pool
+   (dt_control_add_job_res), independent of the GUI main loop pumping --
+   confirmed by reading develop.c:283-302, the exact analogue of
+   dt_dev_process_preview(). The snapshot+apply+trigger step runs on the GUI
+   thread via _run_on_gui_sync (dt_dev_zoom_move's own
+   dt_control_queue_redraw_widget calls want that thread); the wait itself
+   is a bounded Lua-thread sleep-poll exactly like preview_cb's, for the
+   same starve-the-GUI-thread reason documented on preview_cb above.
+
+   KNOWN, ACCEPTED, NARROW RACE (documented, not fixed -- same class of risk
+   preview()'s own comment accepts for its job-queue "reserved slot"
+   guarantee): if a pipe job for this exact port is ALREADY mid-flight
+   (pipe->processing) the moment we call, our explicit trigger no-ops
+   (mirrors dt_dev_process_image's own guard) and that in-flight job may
+   have started before our zoom change and so will not reflect it. The poll
+   loop re-issues the GUI-thread trigger once more, at the halfway point of
+   the timeout, as a cheap defensive retry; a fully provable zero-race
+   guarantee would need job-queue internals changes, out of scope here.
+
+   RENDERABLE_PX (requirement 4) is intentionally NOT computed by this
+   binding: it only reports the geometry it actually changed (previous/
+   applied/clamped/pipe_ready). darktable_mcp/server.py computes
+   achieved.region via a plain get_viewport() re-read after this call
+   returns (truthful by construction, no duplicated math) and renderable_px
+   via an ACTUAL probe call to the existing preview() binding at the
+   achieved region with a generous max_w/max_h, reading back its real
+   reported width/height. A probe, not a formula, because dev->preview_pipe
+   -- which capture_viewport's pixel path always reads regardless of which
+   viewport's region is used -- has a FIXED native resolution entirely
+   decoupled from any dev->full/preview2 zoom (see the port=NULL note
+   above): computing renderable_px from this binding's own zoom state would
+   NOT predict what capture_viewport actually returns. */
+
 typedef struct
 {
-  gboolean in_darkroom;      // out: dev in darkroom with an image loaded
-  int want_ts;               // out: dev->timestamp we require the frame to match
-  dt_dev_pixelpipe_t *pp;    // out: the preview pipe pointer (stable while in darkroom)
+  const char *viewport_name;          // in: "main" | "preview2"
+  gboolean is_set;                    // in: TRUE = set_viewport (clamp + DT_ZOOM_FREE),
+                                       //     FALSE = restore_viewport (no clamp, caller's own mode)
+  dt_dev_zoom_t mode;                 // in: DT_ZOOM_FREE (set) or previous.zoom (restore)
+  int mode_closeup;                   // in: 0 (set) or previous.closeup (restore)
+  float requested_scale;              // in
+  float target_zoom_x, target_zoom_y; // in
+
+  gboolean ok;                        // out
+  gboolean viewport_not_active;       // out: preview2 requested but not open
+  dt_dev_viewport_t *port;            // out
+  dt_dev_pixelpipe_t *pipe;           // out
+
+  dt_dev_zoom_t prev_zoom;            // out
+  int prev_closeup;                   // out
+  float prev_zoom_x, prev_zoom_y;     // out
+  float prev_scale;                   // out (effective, dt_dev_get_zoom_scale)
+
+  float applied_scale;                // out (after clamp, when is_set)
+  gboolean scale_clamped;             // out
+  float scale_floor, scale_ceiling;   // out
+} dt_lua_viewport_op_t;
+
+/* GUI-thread step: resolve the port, snapshot "previous", clamp scale
+   (set_viewport only -- restore_viewport passes an already-known-good
+   previous.scale through unclamped, there is nothing to clamp when
+   reproducing an exact prior state), apply the two dt_dev_zoom_move calls,
+   and queue a fresh worker run for the port's own pipe. Mirrors
+   _preview_snapshot_gui's role for preview_cb below. */
+static void _viewport_op_apply_gui(void *data)
+{
+  dt_lua_viewport_op_t *s = (dt_lua_viewport_op_t *)data;
+  dt_develop_t *dev = darktable.develop;
+  if(!dev || !dev->gui_attached || !dt_is_valid_imgid(dev->image_storage.id))
+  {
+    s->ok = FALSE;
+    return;
+  }
+
+  dt_dev_viewport_t *port = NULL;
+  if(!g_strcmp0(s->viewport_name, "main"))
+  {
+    port = &dev->full;
+  }
+  else if(!g_strcmp0(s->viewport_name, "preview2"))
+  {
+    const gboolean p2_active = (dev->second_wnd != NULL) && (dev->preview2.widget != NULL);
+    if(!p2_active)
+    {
+      s->ok = FALSE;
+      s->viewport_not_active = TRUE;
+      return;
+    }
+    port = &dev->preview2;
+  }
+  else
+  {
+    s->ok = FALSE; // caller already validated the string; defensive only
+    return;
+  }
+
+  s->port = port;
+  s->pipe = port->pipe;
+
+  dt_dev_get_viewport_params(port, &s->prev_zoom, &s->prev_closeup, &s->prev_zoom_x, &s->prev_zoom_y);
+  s->prev_scale = dt_dev_get_zoom_scale(port, s->prev_zoom, 1 << s->prev_closeup, FALSE);
+
+  float scale = s->requested_scale;
+  const int closeup = s->mode_closeup;
+  const dt_dev_zoom_t mode = s->mode;
+
+  if(s->is_set)
+  {
+    const float fitscale = dt_dev_get_zoom_scale(port, DT_ZOOM_FIT, 1, FALSE);
+    const float ppd = (float)port->ppd > 0.0f ? (float)port->ppd : 1.0f;
+    s->scale_floor = fminf(0.5f * fitscale, 1.0f / ppd);
+    s->scale_ceiling = 16.0f / ppd;
+    if(scale < s->scale_floor)
+    {
+      scale = s->scale_floor;
+      s->scale_clamped = TRUE;
+    }
+    else if(scale > s->scale_ceiling)
+    {
+      scale = s->scale_ceiling;
+      s->scale_clamped = TRUE;
+    }
+  }
+  s->applied_scale = scale;
+
+  // (1) zoom-mode call: sets port->closeup/zoom_scale/zoom. x=y=-1 skips the
+  // cursor-relative adjustment so pan is untouched here -- call (2) sets it
+  // explicitly regardless.
+  dt_dev_zoom_move(port, mode, scale, closeup, -1.0f, -1.0f, FALSE);
+  // (2) absolute pan.
+  dt_dev_zoom_move(port, DT_ZOOM_POSITION, 0.0f, 0, s->target_zoom_x, s->target_zoom_y, FALSE);
+
+  // Queue a fresh worker run for THIS port's own pipe (mirrors preview()'s
+  // explicit dt_dev_process_preview trigger). A no-op if a job for this pipe
+  // is already in flight -- see the accepted-race note above.
+  if(port == &dev->full)
+    dt_dev_process_image(dev);
+  else
+    dt_dev_process_preview2(dev);
+
+  s->ok = TRUE;
+}
+
+/* _run_on_gui_sync trampolines for the wait loop's defensive re-trigger
+   below -- kept as real functions (not a cast function pointer) to avoid
+   any -Wcast-function-type risk under -Werror. */
+static void _gui_trigger_full_reprocess(void *data)
+{
+  dt_develop_t *dev = (dt_develop_t *)data;
+  if(dev) dt_dev_process_image(dev);
+}
+static void _gui_trigger_preview2_reprocess(void *data)
+{
+  dt_develop_t *dev = (dt_develop_t *)data;
+  if(dev) dt_dev_process_preview2(dev);
+}
+
+/* Bounded Lua-thread sleep-poll for `pipe`'s DT_DEV_PIPE_ZOOMED bit to clear
+   (see the long note above for why this bit, not preview_cb's timestamp
+   check, is the correct freshness signal for a zoom/pan change). Re-issues
+   the GUI-thread trigger once, halfway through the timeout, as a cheap
+   defensive retry against the narrow accepted race documented above.
+   Returns TRUE (fresh) or FALSE (timed out); always writes elapsed ms. */
+static gboolean _wait_pipe_zoom_fresh(dt_dev_viewport_t *port, dt_dev_pixelpipe_t *pipe,
+                                      int timeout_ms, int *waited_ms_out)
+{
+  const int step_ms = 15;
+  int waited = 0;
+  gboolean retried = FALSE;
+  while(waited < timeout_ms)
+  {
+    const gboolean fresh = !(pipe->changed & DT_DEV_PIPE_ZOOMED) && pipe->status == DT_DEV_PIXELPIPE_VALID;
+    if(fresh)
+    {
+      if(waited_ms_out) *waited_ms_out = waited;
+      return TRUE;
+    }
+    if(!retried && waited >= timeout_ms / 2 && !pipe->processing)
+    {
+      retried = TRUE;
+      dt_develop_t *dev = darktable.develop;
+      if(dev)
+      {
+        if(port == &dev->full)
+          _run_on_gui_sync(_gui_trigger_full_reprocess, dev);
+        else
+          _run_on_gui_sync(_gui_trigger_preview2_reprocess, dev);
+      }
+    }
+    dt_lua_unlock();
+    g_usleep((gulong)step_ms * 1000);
+    dt_lua_lock();
+    waited += step_ms;
+  }
+  if(waited_ms_out) *waited_ms_out = waited;
+  return FALSE;
+}
+
+/* darktable.develop.set_viewport(viewport, zoom_x, zoom_y, scale
+                                  [, wait_for_pipe][, timeout_ms])
+   See the design note above. Registered WITHOUT dt_lua_gtk_wrap -- like
+   preview_cb, the wait must run on the Lua thread, not the GUI thread.
+   Returns {ok=true, viewport=, previous={zoom,zoom_label,closeup,zoom_x,
+   zoom_y,scale}, applied={zoom_x,zoom_y,scale}, clamped=[{field="scale",
+   requested=,clamped_to=,floor=,ceiling=}] (empty array if no clamp),
+   pipe_ready=, waited_ms=} or {error=...} (includes "viewport_not_active:
+   ..." when viewport="preview2" and the second window is not open). */
+static int set_viewport_cb(lua_State *L)
+{
+  const char *viewport_name = luaL_checkstring(L, 1);
+  const double zoom_x_arg = luaL_checknumber(L, 2);
+  const double zoom_y_arg = luaL_checknumber(L, 3);
+  const double scale_arg = luaL_checknumber(L, 4);
+  const gboolean wait_for_pipe = lua_isnoneornil(L, 5) ? TRUE : lua_toboolean(L, 5);
+  const int timeout_ms = luaL_optinteger(L, 6, 4000);
+
+  if(g_strcmp0(viewport_name, "main") && g_strcmp0(viewport_name, "preview2"))
+    return push_error(L, "viewport must be 'main' or 'preview2' (got '%s')", viewport_name);
+
+  dt_lua_viewport_op_t s = { .viewport_name = viewport_name, .is_set = TRUE,
+                            .mode = DT_ZOOM_FREE, .mode_closeup = 0,
+                            .requested_scale = (float)scale_arg,
+                            .target_zoom_x = (float)zoom_x_arg, .target_zoom_y = (float)zoom_y_arg };
+  _run_on_gui_sync(_viewport_op_apply_gui, &s);
+
+  if(s.viewport_not_active)
+    return push_error(L, "viewport_not_active: preview2 window is not open");
+  if(!s.ok)
+    return push_error(L, "not in darkroom / no image loaded");
+
+  int waited_ms = 0;
+  gboolean pipe_ready = TRUE;
+  if(wait_for_pipe)
+    pipe_ready = _wait_pipe_zoom_fresh(s.port, s.pipe, timeout_ms, &waited_ms);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE); lua_setfield(L, -2, "ok");
+  lua_pushstring(L, viewport_name); lua_setfield(L, -2, "viewport");
+
+  lua_newtable(L);
+  lua_pushinteger(L, (lua_Integer)s.prev_zoom); lua_setfield(L, -2, "zoom");
+  lua_pushstring(L, _zoom_name(s.prev_zoom)); lua_setfield(L, -2, "zoom_label");
+  lua_pushinteger(L, s.prev_closeup); lua_setfield(L, -2, "closeup");
+  lua_pushnumber(L, s.prev_zoom_x); lua_setfield(L, -2, "zoom_x");
+  lua_pushnumber(L, s.prev_zoom_y); lua_setfield(L, -2, "zoom_y");
+  lua_pushnumber(L, s.prev_scale); lua_setfield(L, -2, "scale");
+  lua_setfield(L, -2, "previous");
+
+  lua_newtable(L);
+  lua_pushnumber(L, s.target_zoom_x); lua_setfield(L, -2, "zoom_x");
+  lua_pushnumber(L, s.target_zoom_y); lua_setfield(L, -2, "zoom_y");
+  lua_pushnumber(L, s.applied_scale); lua_setfield(L, -2, "scale");
+  lua_setfield(L, -2, "applied");
+
+  lua_newtable(L); // clamped: array, empty when nothing was clamped
+  if(s.scale_clamped)
+  {
+    lua_newtable(L);
+    lua_pushstring(L, "scale"); lua_setfield(L, -2, "field");
+    lua_pushnumber(L, scale_arg); lua_setfield(L, -2, "requested");
+    lua_pushnumber(L, s.applied_scale); lua_setfield(L, -2, "clamped_to");
+    lua_pushnumber(L, s.scale_floor); lua_setfield(L, -2, "floor");
+    lua_pushnumber(L, s.scale_ceiling); lua_setfield(L, -2, "ceiling");
+    lua_rawseti(L, -2, 1);
+  }
+  lua_setfield(L, -2, "clamped");
+
+  lua_pushboolean(L, pipe_ready); lua_setfield(L, -2, "pipe_ready");
+  lua_pushinteger(L, waited_ms); lua_setfield(L, -2, "waited_ms");
+
+  return 1;
+}
+
+/* darktable.develop.restore_viewport(viewport, zoom, closeup, zoom_x,
+                                      zoom_y, scale[, wait_for_pipe]
+                                      [, timeout_ms])
+   Reproduces an EXACT prior state -- the same {zoom,closeup,zoom_x,zoom_y,
+   scale} tuple get_viewport()'s (and set_viewport()'s `previous`) fields
+   already provide (requirement 7, "no new state needs inventing"). `zoom`
+   is the raw integer enum (the `zoom` field, not `zoom_label`); it is
+   ALWAYS one of DT_ZOOM_FIT/FILL/DT_ZOOM_1/FREE in practice (the only 4
+   values ever actually stored into port->zoom -- see the design note
+   above), so there is no sentinel-collision risk with DT_ZOOM_1's
+   closeup==-1/-2 interactive-toggle branches (we always pass a concrete,
+   non-negative closeup here). `scale` is used verbatim for FREE and is a
+   harmless placeholder for FIT/FILL/DT_ZOOM_1 (those recompute their
+   effective scale fresh on every read via dt_dev_get_zoom_scale's switch,
+   ignoring the raw stored value). No clamping: a state that was once valid
+   is restored as-is. Returns {ok=true, viewport=, pipe_ready=, waited_ms=}
+   or {error=...}. */
+static int restore_viewport_cb(lua_State *L)
+{
+  const char *viewport_name = luaL_checkstring(L, 1);
+  const int zoom_arg = luaL_checkinteger(L, 2);
+  const int closeup_arg = luaL_checkinteger(L, 3);
+  const double zoom_x_arg = luaL_checknumber(L, 4);
+  const double zoom_y_arg = luaL_checknumber(L, 5);
+  const double scale_arg = luaL_checknumber(L, 6);
+  const gboolean wait_for_pipe = lua_isnoneornil(L, 7) ? TRUE : lua_toboolean(L, 7);
+  const int timeout_ms = luaL_optinteger(L, 8, 4000);
+
+  if(g_strcmp0(viewport_name, "main") && g_strcmp0(viewport_name, "preview2"))
+    return push_error(L, "viewport must be 'main' or 'preview2' (got '%s')", viewport_name);
+
+  dt_lua_viewport_op_t s = { .viewport_name = viewport_name, .is_set = FALSE,
+                            .mode = (dt_dev_zoom_t)zoom_arg, .mode_closeup = closeup_arg,
+                            .requested_scale = (float)scale_arg,
+                            .target_zoom_x = (float)zoom_x_arg, .target_zoom_y = (float)zoom_y_arg };
+  _run_on_gui_sync(_viewport_op_apply_gui, &s);
+
+  if(s.viewport_not_active)
+    return push_error(L, "viewport_not_active: preview2 window is not open");
+  if(!s.ok)
+    return push_error(L, "not in darkroom / no image loaded");
+
+  int waited_ms = 0;
+  gboolean pipe_ready = TRUE;
+  if(wait_for_pipe)
+    pipe_ready = _wait_pipe_zoom_fresh(s.port, s.pipe, timeout_ms, &waited_ms);
+
+  lua_newtable(L);
+  lua_pushboolean(L, TRUE); lua_setfield(L, -2, "ok");
+  lua_pushstring(L, viewport_name); lua_setfield(L, -2, "viewport");
+  lua_pushboolean(L, pipe_ready); lua_setfield(L, -2, "pipe_ready");
+  lua_pushinteger(L, waited_ms); lua_setfield(L, -2, "waited_ms");
+  return 1;
+}
+
+/* GUI-thread snapshot + conditional (re)trigger of the preview worker.
+
+   VIEWPORT SELECTOR (2026-07-31, extending set_viewport's own fix): `in`
+   `viewport_name` picks WHICH pipe this grabs a backbuf from --
+   NULL/""/"preview_pipe" (the original, default behavior, unchanged for
+   every existing caller) reads dev->preview_pipe, a FIXED-native-resolution
+   full-frame pipe entirely independent of any darkroom zoom (confirmed:
+   dt_dev_process_preview_job_run processes it with port=NULL). "main"/
+   "preview2" instead read dev->full.pipe / dev->preview2.pipe -- the SAME
+   pipes set_viewport's dt_dev_zoom_move actually zooms, and the SAME ones
+   the darkroom GUI itself paints the center view from (views/darkroom.c's
+   expose path just cairo-paints this exact backbuf, scaled by zoom_scale --
+   confirmed by reading dt_dev_pixelpipe_process's terminal backbuf write,
+   pixelpipe_hb.c:3277-3309: it is UNCONDITIONAL for every pipe type except a
+   distinct 4-float encoding for dt_pipe_is_screen, so dev->full.pipe gets a
+   backbuf/backbuf_width/backbuf_height/backbuf_mutex populated the exact
+   same way preview_pipe's already is). Because dt_dev_process_image_job
+   computes x,y,wd,ht FROM THE CURRENT zoom_x/zoom_y/scale (develop.c:
+   769-784) and wd/ht are capped by the WINDOW size (not by any fixed
+   preview budget), a tight zoom devotes the window's ENTIRE fixed pixel
+   budget to a small region -- this is the actual mechanism that makes
+   "zoom in for more detail" work, and it is what was MISSING before: this
+   binding used to always read preview_pipe regardless of viewport, so
+   set_viewport's zoom changed WHAT get_viewport().region reported but
+   never what capture_viewport's pixels actually were.
+
+   FRESHNESS is likewise pipe-appropriate: content edits (dt_dev_add_
+   history_item -> dt_dev_invalidate_all, develop.c:314) mark ALL THREE
+   pipes DIRTY and bump dev->timestamp UNIFORMLY, so the timestamp check
+   below is already correct for main/preview2 exactly as it always was for
+   preview_pipe. But a PURE ZOOM/PAN change (dt_dev_zoom_move) does NOT
+   bump dev->timestamp at all (only content edits do) -- it only sets
+   port->pipe->changed |= DT_DEV_PIPE_ZOOMED (develop.c:3388), cleared once
+   dt_dev_process_image_job actually re-runs at the new zoom (develop.c:
+   788,837-858). So for main/preview2 this ALSO requires that bit clear --
+   exactly the same freshness signal set_viewport_cb's own wait_for_pipe
+   already uses, and for the same reason (see the long note above
+   _viewport_op_apply_gui). preview_pipe never has this bit touched (zoom
+   never applies to it), so the extra check is a harmless no-op there --
+   gated on check_zoomed anyway to keep the two cases visibly distinct. */
+typedef struct
+{
+  const char *viewport_name; // in: NULL/""/"preview_pipe" (default), "main", "preview2"
+  gboolean in_darkroom;       // out: dev in darkroom with an image loaded
+  gboolean viewport_not_active; // out: preview2 requested but its window is not open
+  gboolean check_zoomed;      // out: TRUE for main/preview2 (needs the extra freshness bit)
+  int want_ts;                // out: dev->timestamp we require the frame to match
+  dt_dev_pixelpipe_t *pp;     // out: the resolved pipe pointer (stable while in darkroom)
 } preview_snapshot_t;
 
 static void _preview_snapshot_gui(void *data)
 {
   preview_snapshot_t *s = (preview_snapshot_t *)data;
   dt_develop_t *dev = darktable.develop;
-  if(!dev || !dev->gui_attached || !dev->preview_pipe
-     || !dt_is_valid_imgid(dev->image_storage.id))
+  if(!dev || !dev->gui_attached || !dt_is_valid_imgid(dev->image_storage.id))
   {
     s->in_darkroom = FALSE;
     return;
   }
+
+  dt_dev_pixelpipe_t *pp = NULL;
+  void (*trigger)(dt_develop_t *) = NULL;
+  gboolean check_zoomed = FALSE;
+
+  const gboolean is_default = !s->viewport_name || !s->viewport_name[0]
+                              || !g_strcmp0(s->viewport_name, "preview_pipe");
+  if(is_default)
+  {
+    if(!dev->preview_pipe) { s->in_darkroom = FALSE; return; }
+    pp = dev->preview_pipe;
+    trigger = dt_dev_process_preview;
+  }
+  else if(!g_strcmp0(s->viewport_name, "main"))
+  {
+    pp = dev->full.pipe;
+    trigger = dt_dev_process_image;
+    check_zoomed = TRUE;
+  }
+  else if(!g_strcmp0(s->viewport_name, "preview2"))
+  {
+    const gboolean p2_active = (dev->second_wnd != NULL) && (dev->preview2.widget != NULL);
+    if(!p2_active)
+    {
+      s->in_darkroom = FALSE;
+      s->viewport_not_active = TRUE;
+      return;
+    }
+    pp = dev->preview2.pipe;
+    trigger = dt_dev_process_preview2;
+    check_zoomed = TRUE;
+  }
+  else
+  {
+    s->in_darkroom = FALSE; // unknown name -- defensive only, preview_cb already validates
+    return;
+  }
+
+  if(!pp)
+  {
+    s->in_darkroom = FALSE;
+    return;
+  }
+
   s->in_darkroom = TRUE;
-  s->pp = dev->preview_pipe;
+  s->pp = pp;
+  s->check_zoomed = check_zoomed;
   s->want_ts = (int)dev->timestamp;
-  // Only kick a fresh worker if the current backbuf is not already a fresh
-  // VALID frame for this edit; avoids a redundant re-render on a plain
-  // (no preceding set_params) preview() call.
-  if(!(s->pp->status == DT_DEV_PIXELPIPE_VALID && s->pp->input_timestamp >= s->want_ts))
-    dt_dev_process_preview(dev);
+  // Only kick a fresh worker if the current backbuf is not already fresh
+  // for BOTH signals that matter for this pipe; avoids a redundant re-render
+  // on a plain (no preceding set_params/set_viewport) preview() call.
+  const gboolean already_fresh =
+    pp->status == DT_DEV_PIXELPIPE_VALID && pp->input_timestamp >= s->want_ts
+    && (!check_zoomed || !(pp->changed & DT_DEV_PIPE_ZOOMED));
+  if(!already_fresh)
+    trigger(dev);
 }
 
 /* Write an 8-bit RGB buffer (tightly packed, w*h*3) to a PNG file via libpng
@@ -2114,15 +2622,36 @@ static int preview_cb(lua_State *L)
     has_region = TRUE;
   }
 
+  // VIEWPORT (2026-07-31, arg 7, optional): "main" | "preview2" read from
+  // dev->full.pipe / dev->preview2.pipe instead of the default
+  // dev->preview_pipe -- see the long note on preview_snapshot_t/
+  // _preview_snapshot_gui above for why this is the fix that makes
+  // set_viewport's zoom actually show up here. Omitted (or nil): ZERO
+  // change from the original preview_pipe behavior, for every existing
+  // caller (get_preview's grain/sharpen/noise-inspection use, etc). When
+  // given, `region` above (if also given) is relative to what THIS pipe's
+  // backbuf currently shows -- for "main"/"preview2" while zoomed in, that
+  // is the CURRENT on-screen crop, not the full image (exactly the same
+  // "relative to the frame the pipe produced" contract this parameter
+  // already had for preview_pipe -- no new semantics, just a different pipe).
+  const char *viewport_name = lua_isnoneornil(L, 7) ? NULL : luaL_checkstring(L, 7);
+  if(viewport_name && g_strcmp0(viewport_name, "main") && g_strcmp0(viewport_name, "preview2"))
+    return push_error(L, "viewport must be 'main' or 'preview2' (or omitted for preview_pipe)");
+
   // (a) GUI-thread snapshot + conditional (re)trigger of the preview worker.
-  preview_snapshot_t snap = { .in_darkroom = FALSE, .want_ts = 0, .pp = NULL };
+  preview_snapshot_t snap = { .viewport_name = viewport_name, .in_darkroom = FALSE,
+                              .viewport_not_active = FALSE, .check_zoomed = FALSE,
+                              .want_ts = 0, .pp = NULL };
   _run_on_gui_sync(_preview_snapshot_gui, &snap);
 
+  if(snap.viewport_not_active)
+    return push_error(L, "viewport_not_active: preview2 window is not open");
   if(!snap.in_darkroom || !snap.pp)
     return push_error(L, "not in darkroom / no image loaded");
 
   dt_dev_pixelpipe_t *pp = snap.pp;
   const int want_ts = snap.want_ts;
+  const gboolean check_zoomed = snap.check_zoomed;
 
   // (b) bounded sleep-poll on the LUA thread for a FRESH VALID frame (§3.4
   // timeout 2000 ms). Sleeping here releases the Lua lock and never touches the
@@ -2133,7 +2662,8 @@ static int preview_cb(lua_State *L)
   gboolean fresh = FALSE;
   while(waited < timeout_ms)
   {
-    if(pp->status == DT_DEV_PIXELPIPE_VALID && pp->input_timestamp >= want_ts)
+    if(pp->status == DT_DEV_PIXELPIPE_VALID && pp->input_timestamp >= want_ts
+       && (!check_zoomed || !(pp->changed & DT_DEV_PIPE_ZOOMED)))
     {
       fresh = TRUE;
       break;
@@ -2225,6 +2755,10 @@ static int preview_cb(lua_State *L)
   // normalized and backbuf-pixel terms, so a caller can verify the crop.
   lua_pushinteger(L, bw); lua_setfield(L, -2, "frame_width");
   lua_pushinteger(L, bh); lua_setfield(L, -2, "frame_height");
+  // Which pipe this actually came from -- never ambiguous which source a
+  // given render's detail level should be attributed to.
+  lua_pushstring(L, viewport_name ? viewport_name : "preview_pipe");
+  lua_setfield(L, -2, "viewport_source");
   if(has_region)
   {
     lua_newtable(L);
@@ -3929,6 +4463,22 @@ int dt_lua_init_develop(lua_State *L)
   dt_lua_gtk_wrap(L);
   lua_pushcclosure(L, dt_lua_type_member_common, 1);
   dt_lua_type_register_const_type(L, type_id, "get_viewport");
+
+  // set_viewport(viewport, zoom_x, zoom_y, scale[, wait_for_pipe]
+  // [, timeout_ms]): writable zoom/pan. Registered DELIBERATELY WITHOUT
+  // dt_lua_gtk_wrap -- exactly like preview() below, the freshness wait must
+  // run on the Lua thread, not the GUI main loop (see the long threading
+  // note above _viewport_op_apply_gui).
+  lua_pushcfunction(L, set_viewport_cb);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "set_viewport");
+
+  // restore_viewport(viewport, zoom, closeup, zoom_x, zoom_y, scale
+  // [, wait_for_pipe][, timeout_ms]): put a previously-snapshotted zoom/pan
+  // state back exactly. Same not-gtk-wrapped reasoning as set_viewport.
+  lua_pushcfunction(L, restore_viewport_cb);
+  lua_pushcclosure(L, dt_lua_type_member_common, 1);
+  dt_lua_type_register_const_type(L, type_id, "restore_viewport");
 
   // backtransform_point(x, y[, len1][, len2]): processed/display-frame
   // normalized point -> pipe-input/mask-frame normalized point (the
