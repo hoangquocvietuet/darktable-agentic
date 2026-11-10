@@ -2061,7 +2061,7 @@ static void _run_on_gui_sync(void (*fn)(void *), void *data)
    KNOWN, ACCEPTED, NARROW RACE (documented, not fixed -- same class of risk
    preview()'s own comment accepts for its job-queue "reserved slot"
    guarantee): if a pipe job for this exact port is ALREADY mid-flight
-   (pipe->processing) the moment we call, our explicit trigger no-ops
+   (dt_pipe_processing(pipe)) the moment we call, our explicit trigger no-ops
    (mirrors dt_dev_process_image's own guard) and that in-flight job may
    have started before our zoom change and so will not reflect it. The poll
    loop re-issues the GUI-thread trigger once more, at the halfway point of
@@ -2226,7 +2226,7 @@ static gboolean _wait_pipe_zoom_fresh(dt_dev_viewport_t *port, dt_dev_pixelpipe_
       if(waited_ms_out) *waited_ms_out = waited;
       return TRUE;
     }
-    if(!retried && waited >= timeout_ms / 2 && !pipe->processing)
+    if(!retried && waited >= timeout_ms / 2 && !dt_pipe_processing(pipe))
     {
       retried = TRUE;
       dt_develop_t *dev = darktable.develop;
@@ -3075,7 +3075,7 @@ static int add_path_mask_cb(lua_State *L)
   dt_masks_gui_form_save_creation(dev, module, form, NULL);
 
   const dt_mask_id_t formid = form->formid;
-  const dt_mask_id_t mask_id = module->blend_params->mask_id;
+  const dt_mask_id_t mask_id = dt_develop_blend_mask_group_id(module, module->blend_params);
 
   // (a) override the group point opacity for THIS form to the requested value.
   dt_masks_form_t *grp = dt_masks_get_from_id(dev, mask_id);
@@ -3094,8 +3094,10 @@ static int add_path_mask_cb(lua_State *L)
     dt_dev_add_masks_history_item(dev, module, TRUE);
   }
 
-  // (b) turn on the drawn-mask blend mode (both bits, like the GUI toggle).
-  module->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  // (b) switch the blend mask on the way the GUI does (_blendop_mask_enable,
+  // blend_gui.c): ENABLED|FLEXI, unless a drawn/flexi mask is already on.
+  if(!(module->blend_params->mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_FLEXI)))
+    module->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_FLEXI;
 
   // (c) commit blend_params + live reprocess (invalidates the pipe so the next
   // preview() shows the localized effect). module->enabled is passed through --
@@ -4608,7 +4610,8 @@ static int list_all_masks_cb(lua_State *L)
     {
       dt_iop_module_t *m = (dt_iop_module_t *)iops->data;
       if(!m || !m->blend_params) continue;
-      dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
+      dt_masks_form_t *grp =
+        dt_masks_get_from_id(dev, dt_develop_blend_mask_group_id(m, m->blend_params));
       if(!grp || !(grp->type & DT_MASKS_GROUP)) continue;
 
       gboolean found = FALSE;
@@ -4708,10 +4711,11 @@ static int attach_mask_cb(lua_State *L)
   grpt->state = DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW | state_bit;
 
   // Bugreport 2026-07-27: attaching a shape to the group is not enough --
-  // the drawn-mask bits still need to be ON for the pipeline to use it (see
-  // the long comment above). OR, never assign, so any bits set by
-  // set_raster_source/mask_raster/mask_object (raster/conditional) survive.
-  module->blend_params->mask_mode |= (DEVELOP_MASK_MASK | DEVELOP_MASK_ENABLED);
+  // the mask still needs to be ON for the pipeline to use it (see the long
+  // comment above). Switch it on as the GUI does (ENABLED|FLEXI), and only
+  // OR, never assign, so raster/conditional bits already set survive.
+  if(!(module->blend_params->mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_FLEXI)))
+    module->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_FLEXI;
 
   dt_dev_add_masks_history_item(dev, module, TRUE);
   dt_masks_iop_update(module);
@@ -4763,7 +4767,8 @@ static int detach_mask_cb(lua_State *L)
   if(!module->blend_params)
     return push_error(L, "module '%s' has no blend params", op);
 
-  dt_masks_form_t *grp = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  dt_masks_form_t *grp =
+    dt_masks_get_from_id(dev, dt_develop_blend_mask_group_id(module, module->blend_params));
   if(!grp || !(grp->type & DT_MASKS_GROUP))
     return push_error(L, "module '%s' instance %d has no shapes group", op, instance);
 
@@ -4833,7 +4838,8 @@ static int list_masks_cb(lua_State *L)
   if(!module->blend_params) return push_error(L, "module '%s' has no blend params", op);
 
   lua_newtable(L);
-  dt_masks_form_t *grp = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  dt_masks_form_t *grp =
+    dt_masks_get_from_id(dev, dt_develop_blend_mask_group_id(module, module->blend_params));
   if(!grp || !(grp->type & DT_MASKS_GROUP)) return 1;  // empty: no drawn masks
 
   int idx = 1;
